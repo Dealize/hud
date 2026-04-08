@@ -141,20 +141,13 @@ function countToolUsage() {
   return result;
 }
 
-// 查找 bun（优先 PATH，退回常见位置）
-function findBun() {
-  try { return execSync('command -v bun 2>/dev/null').toString().trim() || null; } catch {}
-  for (const p of ['/opt/homebrew/bin/bun', '/usr/local/bin/bun', `${homedir()}/.bun/bin/bun`]) {
-    if (existsSync(p)) return p;
-  }
-  return null;
-}
-const bunPath = findBun();
+let tokensLine = '';
 
-if (pluginDir && bunPath) {
-  const r = spawnSync(bunPath, ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
+if (pluginDir) {
+  // 给 claude-hud 足够宽度拿完整输出，外层再按 termWidth 截断
+  const r = spawnSync('/opt/homebrew/bin/bun', ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
     input,
-    env: { ...process.env, COLUMNS: String(termWidth) },
+    env: { ...process.env, COLUMNS: '500' },
     encoding: 'utf8',
   });
   if (r.stdout) {
@@ -172,17 +165,27 @@ if (pluginDir && bunPath) {
         const modelPart = rawParts.splice(modelPartIdx, 1)[0].trim();
         rawParts.push(modelPart);
       }
-      // 找 tokens 行并抽出简化
-      const tokIdx = lines.findIndex(l => /Tokens\s+[\d.]+[KMG]/.test(stripAnsi(l)));
-      if (tokIdx >= 0) {
-        const tokRaw = stripAnsi(lines[tokIdx]);
-        const m = tokRaw.match(/Tokens\s+([\d.]+[KMG]?)\s*\(in:\s*([\d.]+[KMG]?),\s*out:\s*([\d.]+[KMG]?)/);
-        if (m) {
-          rawParts.push(`\x1b[2mTokens: ${m[1]}(in:${m[2]} out:${m[3]})\x1b[0m`);
-        }
-        lines.splice(tokIdx, 1);
-      }
       lines[idIdx] = rawParts.map(p => p.trim()).join(' │ ');
+    }
+
+    // 把"(重置剩余 3h 36m)"或"(resets in 3h 36m)" → "(3h 36m)"
+    for (let i = 0; i < lines.length; i++) {
+      lines[i] = lines[i]
+        .replace(/重置剩余\s*/g, '')
+        .replace(/resets?\s+in\s+/gi, '');
+    }
+
+    // 抽出 tokens 行（带 cache），稍后插到末尾
+    const tokIdx = lines.findIndex(l => /Tokens\s+[\d.]/.test(stripAnsi(l)));
+    if (tokIdx >= 0) {
+      const raw = stripAnsi(lines[tokIdx]);
+      const N = '([\\d.]+[kKmMgG]?)';
+      const m = raw.match(new RegExp(`Tokens\\s+${N}\\s*\\(in:\\s*${N},\\s*out:\\s*${N}(?:,\\s*cache:\\s*${N})?`));
+      if (m) {
+        const [, total, inTok, outTok, cacheTok] = m;
+        tokensLine = `\x1b[2mTokens: ${total}  in:${inTok}  out:${outTok}${cacheTok ? `  cache:${cacheTok}` : ''}\x1b[0m`;
+      }
+      lines.splice(tokIdx, 1);
     }
 
     // 找 MCPs/钩子 行索引
@@ -509,10 +512,12 @@ if (tier === 'full') {
   process.stdout.write(`${dim('💬 会话')} ${cyan('本项目')} ${projectSessions} · ${cyan('今日')} ${sAgg.today}${sT} · ${cyan('7日均')} ${sAgg.avg7}${sW} · ${cyan('30日均')} ${sAgg.avg30} · ${cyan('全部')} ${globalSessions}${thinking}\n`);
   const speedLine = renderSpeedLine();
   if (speedLine) process.stdout.write(speedLine + '\n');
+  if (tokensLine) process.stdout.write(tokensLine + '\n');
 } else if (tier === 'medium') {
   // 压缩：指令 + 会话 合并一行，去掉 30日均；速度一行保留 sparkline
   process.stdout.write(`${dim('📝')} ${sessionCount}${dim('/')}${pAgg.today}${pT}${dim('/')}${pAgg.avg7}${pW}${dim('/')}${globalCount} ${dim('│ 💬')} ${projectSessions}${dim('/')}${sAgg.today}${sT}${dim('/')}${sAgg.avg7}${sW}${dim('/')}${globalSessions}\n`);
   const speedLine = renderSpeedLine();
   if (speedLine) process.stdout.write(speedLine + '\n');
+  if (tokensLine) process.stdout.write(tokensLine + '\n');
 }
 // compact 不输出额外行（只保留 claude-hud 原生 + identity/env 行）
