@@ -38,8 +38,8 @@ function detectTerminalWidth() {
 // 预留 4 字符安全边距，避免 Claude Code 再截一次时误伤
 const rawWidth = detectTerminalWidth() || 100;
 const termWidth = Math.max(40, rawWidth - 4);
-// 自适应分层：full ≥160，medium 120-159，compact <120
-const tier = rawWidth >= 160 ? 'full' : rawWidth >= 120 ? 'medium' : 'compact';
+// 自适应分层：full ≥130，medium 90-129，compact <90
+const tier = rawWidth >= 130 ? 'full' : rawWidth >= 90 ? 'medium' : 'compact';
 
 // 颜色调色板
 const C = {
@@ -168,17 +168,17 @@ function countToolUsage() {
   return result;
 }
 
+let tokensLine = '';
+
 // 查找 bun（优先 PATH，退回常见位置）
 function findBun() {
-  try { return execSync('command -v bun 2>/dev/null').toString().trim() || null; } catch {}
-  for (const p of ['/opt/homebrew/bin/bun', '/usr/local/bin/bun', `${homedir()}/.bun/bin/bun`]) {
-    if (existsSync(p)) return p;
+  try { return require("child_process").execSync("command -v bun 2>/dev/null").toString().trim() || null; } catch {}
+  for (const p of ["/opt/homebrew/bin/bun", "/usr/local/bin/bun", `${require("os").homedir()}/.bun/bin/bun`]) {
+    if (require("fs").existsSync(p)) return p;
   }
   return null;
 }
 const bunPath = findBun();
-
-let tokensLine = '';
 
 if (pluginDir && bunPath) {
   const r = spawnSync(bunPath, ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
@@ -290,7 +290,15 @@ if (pluginDir && bunPath) {
       };
       const { running: sRunning, total: sTotal } = usage.subagent;
       if (sTotal > 0) prefixParts.push(renderTool('SubAgent', sRunning, sTotal));
-      const toolEntries = Object.entries(usage.tools).sort((a, b) => b[1].total - a[1].total);
+      // 所有 mcp__ 工具合并成单个 mcp 桶
+      const merged = {};
+      for (const [name, stats] of Object.entries(usage.tools)) {
+        const key = /^mcp__/.test(name) ? 'mcp' : name;
+        if (!merged[key]) merged[key] = { running: 0, total: 0 };
+        merged[key].running += stats.running;
+        merged[key].total += stats.total;
+      }
+      const toolEntries = Object.entries(merged).sort((a, b) => b[1].total - a[1].total);
       for (const [name, { running, total }] of toolEntries) {
         prefixParts.push(renderTool(name, running, total));
       }
@@ -312,15 +320,38 @@ if (pluginDir && bunPath) {
       for (const i of activityIdxs.slice().reverse()) lines.splice(i, 1);
     }
 
-    // compact: 只留身份行
+    // compact: 只留身份行，且把身份行削到只剩项目名（避免被截断成半个字）
     let finalLines = lines;
     if (tier === 'compact') {
-      finalLines = lines.slice(0, 1);
+      if (idIdx >= 0) {
+        // 只留 📁 项目部分
+        const s = stripAnsi(lines[idIdx]);
+        const m = s.match(/📁\s*([^│]+)/);
+        if (m) {
+          finalLines = [`📁 ${wrap(C.brightCyan, m[1].trim())}`];
+        } else {
+          finalLines = [lines[idIdx]];
+        }
+      } else {
+        finalLines = lines.slice(0, 1);
+      }
     } else if (tier === 'medium') {
-      // medium: 身份行 + env 合并行（如果存在）
+      // medium: 身份行（削短：项目 + 时长）+ env 行 + 上下文行
+      if (idIdx >= 0) {
+        const s = stripAnsi(lines[idIdx]);
+        const proj = s.match(/📁\s*([^│]+)/)?.[1]?.trim() || '';
+        const time = s.match(/⏱\s*([^│]+)/)?.[1]?.trim() || '';
+        const parts = [];
+        if (proj) parts.push(`📁 ${wrap(C.brightCyan, proj)}`);
+        if (time) parts.push(`⏱  ${wrap(C.brightMagenta, time)}`);
+        lines[idIdx] = parts.join(wrap(C.dim, ' │ '));
+      }
       const keep = [0];
-      if (envIdx >= 0 && envIdx !== 0) keep.push(envIdx - activityIdxs.filter(i => i < envIdx).length);
-      finalLines = keep.map(i => lines[i]).filter(Boolean);
+      // 上下文行（如果存在且不是身份行）
+      const ctxIdx = lines.findIndex((l, i) => i !== idIdx && /上下文|context/i.test(stripAnsi(l)));
+      if (ctxIdx > 0) keep.push(ctxIdx);
+      if (envIdx >= 0 && !keep.includes(envIdx)) keep.push(envIdx);
+      finalLines = [...new Set(keep)].sort((a, b) => a - b).map(i => lines[i]).filter(Boolean);
     }
 
     process.stdout.write(finalLines.join('\n') + '\n');
@@ -621,7 +652,7 @@ if (tier === 'full') {
   // 5. 🪙 tokens
   if (tokensLine) process.stdout.write(tokensLine + '\n');
 
-  // 6. 📝 指令
+  // 6. 📝 对话次数
   const promptParts = [
     `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
     `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
@@ -629,9 +660,9 @@ if (tier === 'full') {
     `${lbl('30日均')} ${wrap(C.cyan, pAgg.avg30)}`,
     `${lbl('全部')} ${wrap(C.dim, globalCount)}`,
   ];
-  process.stdout.write(`📝 ${promptParts.join(wrap(C.dim, ' · '))}\n`);
+  process.stdout.write(`📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}\n`);
 
-  // 6. 💬 会话
+  // 7. 💬 会话次数
   const sessParts = [
     `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
     `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
@@ -639,7 +670,7 @@ if (tier === 'full') {
     `${lbl('30日均')} ${wrap(C.cyan, sAgg.avg30)}`,
     `${lbl('全部')} ${wrap(C.dim, globalSessions)}`,
   ];
-  process.stdout.write(`💬 ${sessParts.join(wrap(C.dim, ' · '))}\n`);
+  process.stdout.write(`💬 ${wrap(C.dim, '会话次数')}  ${sessParts.join(wrap(C.dim, ' · '))}\n`);
 
   // 8. sparkline 独立行
   if (sparkLine) process.stdout.write(sparkLine + '\n');
