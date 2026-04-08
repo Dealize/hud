@@ -181,7 +181,6 @@ const bunPath = findBun();
 let tokensLine = '';
 
 if (pluginDir && bunPath) {
-  // 给 claude-hud 足够宽度拿完整输出，外层再按 termWidth 截断
   const r = spawnSync(bunPath, ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
     input,
     env: { ...process.env, COLUMNS: '500' },
@@ -208,16 +207,35 @@ if (pluginDir && bunPath) {
       const idParts = [];
       if (projectPart) idParts.push(`📁 ${wrap(C.brightCyan, projectPart)}`);
       if (sessionPart) idParts.push(wrap(C.dim, sessionPart));
-      if (timePart) idParts.push(`⏱  ${wrap(C.brightMagenta, timePart)}`);
+      if (timePart) {
+        // 3h 9m → 3:09，45m → 0:45
+        const hm = timePart.match(/(?:(\d+)h)?\s*(\d+)m/);
+        const fmt = hm ? `${hm[1] || '0'}:${String(hm[2]).padStart(2, '0')}` : timePart;
+        idParts.push(`⏱  ${wrap(C.brightMagenta, fmt)}`);
+      }
       if (modelPart) idParts.push(wrap(C.cyan, modelPart));
       lines[idIdx] = idParts.join(wrap(C.dim, ' │ '));
     }
 
-    // 倒计时：去掉「重置剩余」和括号，只留时间字符串（保留位置）
+    // Xh Ym → X:YY 的格式化（保留 d 天前缀）
+    const fmtHM = (raw) => {
+      const t = raw.trim();
+      // 含天：3d 22h → 3d 22:00 ? 简单：保留 d，把后面 h m 转成冒号
+      const dM = t.match(/^(\d+d)\s*(.*)$/);
+      const prefix = dM ? `${dM[1]} ` : '';
+      const rest = dM ? dM[2] : t;
+      const hm = rest.match(/^(?:(\d+)h)?\s*(?:(\d+)m)?$/);
+      if (!hm || (!hm[1] && !hm[2])) return t;
+      const h = hm[1] || '0';
+      const m = (hm[2] || '0').padStart(2, '0');
+      return `${prefix}${h}:${m}`;
+    };
+
+    // 倒计时：去掉「重置剩余」和括号，转格式
     for (let i = 0; i < lines.length; i++) {
       lines[i] = lines[i]
-        .replace(/\(\s*重置剩余\s*([^)]+?)\s*\)/g, (_, t) => wrap(C.dim, t.trim()))
-        .replace(/\(\s*resets?\s+in\s+([^)]+?)\s*\)/gi, (_, t) => wrap(C.dim, t.trim()));
+        .replace(/\(\s*重置剩余\s*([^)]+?)\s*\)/g, (_, t) => wrap(C.dim, fmtHM(t)))
+        .replace(/\(\s*resets?\s+in\s+([^)]+?)\s*\)/gi, (_, t) => wrap(C.dim, fmtHM(t)));
     }
 
     // 给上下文/用量/本周行加 ⏳ 前缀，并按阈值染色所有百分比
@@ -470,7 +488,8 @@ if (cwd) {
 
 const thinking = '';
 
-// 5) token 速度 + sparkline
+// 5) token 速度 + sparkline（拆成两个返回值）
+let sparkLine = '';
 function renderSpeedLine() {
   if (!meta.transcript_path || !existsSync(meta.transcript_path)) return '';
   // 从 transcript 取 token 总量
@@ -561,7 +580,11 @@ function renderSpeedLine() {
   const curColor = speeds.length === 0 ? C.dim : speedColor(current, peak);
   const avgColor = speedColor(sessionAvg, peak);
   const sessPeakColor = speedColor(sessionMax, peak);
-  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')} ${dim('━━')} ${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}  ${dim(spark)} ${dim(marker)}`;
+  // sparkline 独立成行，存到模块级 sparkLine
+  if (termWidth >= 140 && speeds.length > 0) {
+    sparkLine = `   ${dim(spark)} ${dim(marker)}`;
+  }
+  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')} ${dim('━━')} ${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}`;
 }
 
 // 5) 输出指令统计行
@@ -591,7 +614,14 @@ function trend(val, base) {
 }
 
 if (tier === 'full') {
-  // 📝 指令
+  // 4. ⚡ 速度（不带 sparkline）
+  const speedLine = renderSpeedLine();
+  if (speedLine) process.stdout.write(speedLine + '\n');
+
+  // 5. 🪙 tokens
+  if (tokensLine) process.stdout.write(tokensLine + '\n');
+
+  // 6. 📝 指令
   const promptParts = [
     `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
     `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
@@ -601,7 +631,7 @@ if (tier === 'full') {
   ];
   process.stdout.write(`📝 ${promptParts.join(wrap(C.dim, ' · '))}\n`);
 
-  // 💬 会话
+  // 6. 💬 会话
   const sessParts = [
     `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
     `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
@@ -611,9 +641,8 @@ if (tier === 'full') {
   ];
   process.stdout.write(`💬 ${sessParts.join(wrap(C.dim, ' · '))}\n`);
 
-  const speedLine = renderSpeedLine();
-  if (speedLine) process.stdout.write(speedLine + '\n');
-  if (tokensLine) process.stdout.write(tokensLine + '\n');
+  // 8. sparkline 独立行
+  if (sparkLine) process.stdout.write(sparkLine + '\n');
 } else if (tier === 'medium') {
   process.stdout.write(`📝 ${num(sessionCount, pAgg.avg7)}${dim('/')}${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}${dim('/')}${num(pAgg.avg7, pAgg.avg30)}${dim('/')}${dim(globalCount)} ${dim('│')} 💬 ${num(projectSessions, 5)}${dim('/')}${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}${dim('/')}${num(sAgg.avg7, sAgg.avg30)}${dim('/')}${dim(globalSessions)}\n`);
   const speedLine = renderSpeedLine();
