@@ -41,6 +41,33 @@ const termWidth = Math.max(40, rawWidth - 4);
 // 自适应分层：full ≥160，medium 120-159，compact <120
 const tier = rawWidth >= 160 ? 'full' : rawWidth >= 120 ? 'medium' : 'compact';
 
+// 颜色调色板
+const C = {
+  reset: '\x1b[0m',
+  dim: '\x1b[2m',
+  bold: '\x1b[1m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+  brightCyan: '\x1b[96m',
+  brightYellow: '\x1b[93m',
+  brightGreen: '\x1b[92m',
+  brightMagenta: '\x1b[95m',
+};
+const wrap = (color, s) => `${color}${s}${C.reset}`;
+// 数值阈值染色：低=绿、中=黄、高=红
+const threshColor = (pct) => pct >= 80 ? C.red : pct >= 60 ? C.yellow : pct >= 30 ? C.brightCyan : C.green;
+// 速度染色：高=亮黄、中=青、低=蓝
+const speedColor = (v, peak) => {
+  if (peak <= 0) return C.dim;
+  const r = v / peak;
+  return r >= 0.7 ? C.brightYellow : r >= 0.3 ? C.brightCyan : C.blue;
+};
+
 // ANSI-aware 截断：保留不可见转义序列，截断可见字符到 maxWidth
 function truncateLine(line, maxWidth) {
   let visible = 0;
@@ -141,11 +168,21 @@ function countToolUsage() {
   return result;
 }
 
+// 查找 bun（优先 PATH，退回常见位置）
+function findBun() {
+  try { return execSync('command -v bun 2>/dev/null').toString().trim() || null; } catch {}
+  for (const p of ['/opt/homebrew/bin/bun', '/usr/local/bin/bun', `${homedir()}/.bun/bin/bun`]) {
+    if (existsSync(p)) return p;
+  }
+  return null;
+}
+const bunPath = findBun();
+
 let tokensLine = '';
 
-if (pluginDir) {
+if (pluginDir && bunPath) {
   // 给 claude-hud 足够宽度拿完整输出，外层再按 termWidth 截断
-  const r = spawnSync('/opt/homebrew/bin/bun', ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
+  const r = spawnSync(bunPath, ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
     input,
     env: { ...process.env, COLUMNS: '500' },
     encoding: 'utf8',
@@ -155,24 +192,48 @@ if (pluginDir) {
     const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
     const lines = r.stdout.replace(/\n$/, '').split('\n');
 
-    // 重排身份行：模型 │ 项目 │ session │ 时长  →  项目 │ session │ 时长 │ 模型 │ tokens
+    // 重排身份行：模型 │ 项目 │ session │ 时长  →  📁 项目 │ ✏️ session │ ⏱ 时长 │ 🤖 模型
     const idIdx = lines.findIndex(l => /\[.+\].*│/.test(stripAnsi(l)));
     if (idIdx >= 0) {
       const rawParts = lines[idIdx].split(/\s*│\s*/);
-      // 找模型片段（带 [] 的那个）
-      const modelPartIdx = rawParts.findIndex(p => /\[.+\]/.test(stripAnsi(p)));
-      if (modelPartIdx >= 0) {
-        const modelPart = rawParts.splice(modelPartIdx, 1)[0].trim();
-        rawParts.push(modelPart);
+      // 取出各部分（重新染色）
+      let projectPart = '', sessionPart = '', timePart = '', modelPart = '';
+      for (const p of rawParts) {
+        const s = stripAnsi(p).trim();
+        if (/\[.+\]/.test(s)) modelPart = s;
+        else if (/⏱/.test(s)) timePart = s.replace(/⏱️?\s*/, '');
+        else if (!projectPart) projectPart = s;
+        else if (!sessionPart) sessionPart = s;
       }
-      lines[idIdx] = rawParts.map(p => p.trim()).join(' │ ');
+      const idParts = [];
+      if (projectPart) idParts.push(`📁 ${wrap(C.brightCyan, projectPart)}`);
+      if (sessionPart) idParts.push(wrap(C.dim, sessionPart));
+      if (timePart) idParts.push(`⏱  ${wrap(C.brightMagenta, timePart)}`);
+      if (modelPart) idParts.push(wrap(C.cyan, modelPart));
+      lines[idIdx] = idParts.join(wrap(C.dim, ' │ '));
     }
 
-    // 把"(重置剩余 3h 36m)"或"(resets in 3h 36m)" → "(3h 36m)"
+    // 倒计时：去掉「重置剩余」和括号，只留时间字符串（保留位置）
     for (let i = 0; i < lines.length; i++) {
       lines[i] = lines[i]
-        .replace(/重置剩余\s*/g, '')
-        .replace(/resets?\s+in\s+/gi, '');
+        .replace(/\(\s*重置剩余\s*([^)]+?)\s*\)/g, (_, t) => wrap(C.dim, t.trim()))
+        .replace(/\(\s*resets?\s+in\s+([^)]+?)\s*\)/gi, (_, t) => wrap(C.dim, t.trim()));
+    }
+
+    // 给上下文/用量/本周行加 ⏳ 前缀，并按阈值染色所有百分比
+    const recolorAllPct = (line) => {
+      // 染所有 N% 数字
+      return line.replace(/(\d+(?:\.\d+)?)\s*%/g, (_, n) => {
+        const pct = parseFloat(n);
+        return wrap(threshColor(pct) + C.bold, `${n}%`);
+      });
+    };
+    for (let i = 0; i < lines.length; i++) {
+      if (i === idIdx) continue;  // 跳过身份行
+      const s = stripAnsi(lines[i]);
+      if (/上下文|context|用量|usage|本周|weekly/i.test(s)) {
+        lines[i] = `⏳  ${recolorAllPct(lines[i])}`;
+      }
     }
 
     // 抽出 tokens 行（带 cache），稍后插到末尾
@@ -183,7 +244,7 @@ if (pluginDir) {
       const m = raw.match(new RegExp(`Tokens\\s+${N}\\s*\\(in:\\s*${N},\\s*out:\\s*${N}(?:,\\s*cache:\\s*${N})?`));
       if (m) {
         const [, total, inTok, outTok, cacheTok] = m;
-        tokensLine = `\x1b[2mTokens: ${total}  in:${inTok}  out:${outTok}${cacheTok ? `  cache:${cacheTok}` : ''}\x1b[0m`;
+        tokensLine = `🪙 ${wrap(C.brightYellow + C.bold, total)} ${wrap(C.dim, '总')}  ${wrap(C.dim, 'in:')}${wrap(C.cyan, inTok)}  ${wrap(C.dim, 'out:')}${wrap(C.green, outTok)}${cacheTok ? `  ${wrap(C.dim, 'cache:')}${wrap(C.brightMagenta, cacheTok)}` : ''}`;
       }
       lines.splice(tokIdx, 1);
     }
@@ -197,28 +258,38 @@ if (pluginDir) {
       if (/^[✓◐✗×]/.test(s) || /[✓◐]\s+\w+\s+×\d+/.test(s)) activityIdxs.push(i);
     }
 
-    // 顺序：SubAgent | 工具计数 │ 5 MCPs | 7 钩子 | 46 技能
-    // 显示语义：已完成/总数，运行中橙色
+    // env 行：🛠 SubAgent | 工具计数 │ MCPs | 钩子 | 技能
     if (envIdx >= 0) {
       const usage = countToolUsage();
       const prefixParts = [];
+      const renderTool = (name, running, total) => {
+        const done = total - running;
+        // 运行中→亮黄；全完成→灰；纯数字部分用亮青突出
+        if (running > 0) {
+          return `${wrap(C.brightYellow + C.bold, `${done}/${total}`)} ${wrap(C.yellow, name)}`;
+        }
+        return `${wrap(C.brightCyan, `${done}/${total}`)} ${wrap(C.dim, name)}`;
+      };
       const { running: sRunning, total: sTotal } = usage.subagent;
-      if (sTotal > 0) {
-        const done = sTotal - sRunning;
-        const col = sRunning > 0 ? '\x1b[33m' : '\x1b[2m';
-        prefixParts.push(`${col}${done}/${sTotal} SubAgent\x1b[0m`);
-      }
+      if (sTotal > 0) prefixParts.push(renderTool('SubAgent', sRunning, sTotal));
       const toolEntries = Object.entries(usage.tools).sort((a, b) => b[1].total - a[1].total);
       for (const [name, { running, total }] of toolEntries) {
-        const done = total - running;
-        const col = running > 0 ? '\x1b[33m' : '\x1b[2m';
-        prefixParts.push(`${col}${done}/${total} ${name}\x1b[0m`);
+        prefixParts.push(renderTool(name, running, total));
       }
-      const prefix = prefixParts.length > 0
-        ? prefixParts.join('\x1b[2m | \x1b[0m') + '\x1b[2m │ \x1b[0m'
-        : '';
-      const suffix = `\x1b[2m | ${skills} 技能\x1b[0m`;
-      lines[envIdx] = prefix + lines[envIdx] + suffix;
+      const sep = wrap(C.dim, ' | ');
+      const bigSep = wrap(C.dim, ' │ ');
+      const prefix = prefixParts.length > 0 ? prefixParts.join(sep) + bigSep : '';
+
+      // 重新染色 claude-hud 自带的 MCPs/钩子 段
+      const envRaw = stripAnsi(lines[envIdx]);
+      const envParts = [];
+      const mcpsM = envRaw.match(/(\d+)\s*MCPs/);
+      const hooksM = envRaw.match(/(\d+)\s*钩子/);
+      if (mcpsM) envParts.push(`${wrap(C.brightCyan, mcpsM[1])} ${wrap(C.dim, 'MCPs')}`);
+      if (hooksM) envParts.push(`${wrap(C.brightCyan, hooksM[1])} ${wrap(C.dim, '钩子')}`);
+      envParts.push(`${wrap(C.brightCyan, String(skills))} ${wrap(C.dim, '技能')}`);
+
+      lines[envIdx] = `🛠  ${prefix}${envParts.join(sep)}`;
       // 删除 claude-hud 自带的活动行
       for (const i of activityIdxs.slice().reverse()) lines.splice(i, 1);
     }
@@ -486,36 +557,65 @@ function renderSpeedLine() {
   }
 
   const currentStr = speeds.length === 0 ? '--' : current.toFixed(0);
-  return `${dim('⚡')} ${sessionAvg.toFixed(0)}${dim('/avg')} ｜ ${sessionMax.toFixed(0)}${dim('/本峰')} ｜ ${state.globalPeak.toFixed(0)}${dim('/史峰')} ${dim('----')} ${dim('当前')}${cyan(currentStr)} ${dim('tok/s')}   ${dim(spark)} ${dim(marker)}`;
+  const peak = state.globalPeak;
+  const curColor = speeds.length === 0 ? C.dim : speedColor(current, peak);
+  const avgColor = speedColor(sessionAvg, peak);
+  const sessPeakColor = speedColor(sessionMax, peak);
+  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')} ${dim('━━')} ${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}  ${dim(spark)} ${dim(marker)}`;
 }
 
 // 5) 输出指令统计行
-const dim = s => `\x1b[2m${s}\x1b[0m`;
-const cyan = s => `\x1b[36m${s}\x1b[0m`;
-// 趋势：与基线比较 → 箭头+颜色
+const dim = s => wrap(C.dim, s);
+const cyan = s => wrap(C.cyan, s);
+const lbl = s => wrap(C.dim, s);
+// 数值染色：基于与基线比例
+function valColor(val, base) {
+  if (!base) return C.brightCyan;
+  const r = val / base;
+  if (r >= 1.5) return C.red + C.bold;
+  if (r >= 1.1) return C.brightYellow;
+  if (r > 0.9)  return C.brightCyan;
+  if (r > 0.5)  return C.green;
+  return C.blue;
+}
+const num = (v, base) => wrap(valColor(v, base), String(v));
+// 趋势箭头
 function trend(val, base) {
   if (!base) return '';
   const r = val / base;
-  if (r >= 1.5) return ' \x1b[31m↑↑\x1b[0m';   // 红
-  if (r >= 1.1) return ' \x1b[33m↑\x1b[0m';     // 橙
-  if (r > 0.9)  return '';                     // 持平不显示
-  if (r > 0.5)  return ' \x1b[32m↓\x1b[0m';     // 绿
-  return ' \x1b[34m↓↓\x1b[0m';                 // 蓝
+  if (r >= 1.5) return wrap(C.red + C.bold, ' ↑↑');
+  if (r >= 1.1) return wrap(C.brightYellow, ' ↑');
+  if (r > 0.9)  return '';
+  if (r > 0.5)  return wrap(C.green, ' ↓');
+  return wrap(C.blue, ' ↓↓');
 }
-const pT = trend(pAgg.today, pAgg.avg7);
-const pW = trend(pAgg.avg7, pAgg.avg30);
-const sT = trend(sAgg.today, sAgg.avg7);
-const sW = trend(sAgg.avg7, sAgg.avg30);
 
 if (tier === 'full') {
-  process.stdout.write(`${dim('📝 指令')} ${cyan('本次')} ${sessionCount} · ${cyan('今日')} ${pAgg.today}${pT} · ${cyan('7日均')} ${pAgg.avg7}${pW} · ${cyan('30日均')} ${pAgg.avg30} · ${cyan('全部')} ${globalCount}\n`);
-  process.stdout.write(`${dim('💬 会话')} ${cyan('本项目')} ${projectSessions} · ${cyan('今日')} ${sAgg.today}${sT} · ${cyan('7日均')} ${sAgg.avg7}${sW} · ${cyan('30日均')} ${sAgg.avg30} · ${cyan('全部')} ${globalSessions}${thinking}\n`);
+  // 📝 指令
+  const promptParts = [
+    `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
+    `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
+    `${lbl('7日均')} ${num(pAgg.avg7, pAgg.avg30)}${trend(pAgg.avg7, pAgg.avg30)}`,
+    `${lbl('30日均')} ${wrap(C.cyan, pAgg.avg30)}`,
+    `${lbl('全部')} ${wrap(C.dim, globalCount)}`,
+  ];
+  process.stdout.write(`📝 ${promptParts.join(wrap(C.dim, ' · '))}\n`);
+
+  // 💬 会话
+  const sessParts = [
+    `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
+    `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
+    `${lbl('7日均')} ${num(sAgg.avg7, sAgg.avg30)}${trend(sAgg.avg7, sAgg.avg30)}`,
+    `${lbl('30日均')} ${wrap(C.cyan, sAgg.avg30)}`,
+    `${lbl('全部')} ${wrap(C.dim, globalSessions)}`,
+  ];
+  process.stdout.write(`💬 ${sessParts.join(wrap(C.dim, ' · '))}\n`);
+
   const speedLine = renderSpeedLine();
   if (speedLine) process.stdout.write(speedLine + '\n');
   if (tokensLine) process.stdout.write(tokensLine + '\n');
 } else if (tier === 'medium') {
-  // 压缩：指令 + 会话 合并一行，去掉 30日均；速度一行保留 sparkline
-  process.stdout.write(`${dim('📝')} ${sessionCount}${dim('/')}${pAgg.today}${pT}${dim('/')}${pAgg.avg7}${pW}${dim('/')}${globalCount} ${dim('│ 💬')} ${projectSessions}${dim('/')}${sAgg.today}${sT}${dim('/')}${sAgg.avg7}${sW}${dim('/')}${globalSessions}\n`);
+  process.stdout.write(`📝 ${num(sessionCount, pAgg.avg7)}${dim('/')}${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}${dim('/')}${num(pAgg.avg7, pAgg.avg30)}${dim('/')}${dim(globalCount)} ${dim('│')} 💬 ${num(projectSessions, 5)}${dim('/')}${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}${dim('/')}${num(sAgg.avg7, sAgg.avg30)}${dim('/')}${dim(globalSessions)}\n`);
   const speedLine = renderSpeedLine();
   if (speedLine) process.stdout.write(speedLine + '\n');
   if (tokensLine) process.stdout.write(tokensLine + '\n');
