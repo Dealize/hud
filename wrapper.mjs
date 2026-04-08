@@ -38,8 +38,8 @@ function detectTerminalWidth() {
 // 预留 4 字符安全边距，避免 Claude Code 再截一次时误伤
 const rawWidth = detectTerminalWidth() || 100;
 const termWidth = Math.max(40, rawWidth - 4);
-// 自适应分层：full ≥130，medium 90-129，compact <90
-const tier = rawWidth >= 130 ? 'full' : rawWidth >= 90 ? 'medium' : 'compact';
+// 自适应分层：≥90 全量，<90 压缩
+const tier = rawWidth >= 90 ? 'full' : 'compact';
 
 // 颜色调色板
 const C = {
@@ -170,15 +170,8 @@ function countToolUsage() {
 
 let tokensLine = '';
 
-// 查找 bun（优先 PATH，退回常见位置）
-function findBun() {
-  try { return require("child_process").execSync("command -v bun 2>/dev/null").toString().trim() || null; } catch {}
-  for (const p of ["/opt/homebrew/bin/bun", "/usr/local/bin/bun", `${require("os").homedir()}/.bun/bin/bun`]) {
-    if (require("fs").existsSync(p)) return p;
-  }
-  return null;
-}
-const bunPath = findBun();
+function findBun(){try{return require("child_process").execSync("command -v bun 2>/dev/null").toString().trim()||null}catch{}for(const p of ["/opt/homebrew/bin/bun","/usr/local/bin/bun",require("os").homedir()+"/.bun/bin/bun"]){if(require("fs").existsSync(p))return p}return null}
+const bunPath=findBun();
 
 if (pluginDir && bunPath) {
   const r = spawnSync(bunPath, ['--env-file', '/dev/null', join(pluginDir, 'src/index.ts')], {
@@ -612,7 +605,7 @@ function renderSpeedLine() {
   const avgColor = speedColor(sessionAvg, peak);
   const sessPeakColor = speedColor(sessionMax, peak);
   // sparkline 独立成行，存到模块级 sparkLine
-  if (termWidth >= 140 && speeds.length > 0) {
+  if (tier === 'full' && speeds.length > 0) {
     sparkLine = `   ${dim(spark)} ${dim(marker)}`;
   }
   return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')} ${dim('━━')} ${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}`;
