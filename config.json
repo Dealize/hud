@@ -1,0 +1,18 @@
+{
+  "lineLayout": "expanded",
+  "language": "zh",
+  "display": {
+    "usageBarEnabled": true,
+    "showUsageLimits": true,
+    "showDuration": true,
+    "showConfigCounts": true,
+    "showTools": true,
+    "showAgents": false,
+    "showTodos": true,
+    "showGit": true,
+    "showSessionName": true,
+    "showSessionTokens": true,
+    "showTokenBreakdown": true,
+    "showOutputSpeed": true
+  }
+}
