@@ -13,14 +13,11 @@ const localDate = (iso) => {
   return `${y}-${m}-${day}`;
 };
 
-// 检测终端宽度：优先用 Claude Code 给的 stdout/stderr/env，退回父进程 tty
+// 检测终端宽度：直接走父进程链找真实 tty（忽略 Claude Code 子进程 pipe 内的小值）
 function detectTerminalWidth() {
-  if (process.stdout?.columns) return process.stdout.columns;
-  if (process.stderr?.columns) return process.stderr.columns;
-  if (process.env.COLUMNS && +process.env.COLUMNS > 0) return +process.env.COLUMNS;
   try {
     let pid = process.ppid;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 6; i++) {
       const tty = execSync(`ps -o tty= -p ${pid} 2>/dev/null || true`).toString().trim();
       if (tty && tty !== '??' && tty !== '?') {
         const size = execSync(`stty size < /dev/${tty} 2>/dev/null || true`).toString().trim();
@@ -29,17 +26,45 @@ function detectTerminalWidth() {
       }
       const parent = execSync(`ps -o ppid= -p ${pid} 2>/dev/null || true`).toString().trim();
       const nextPid = parseInt(parent, 10);
-      if (!nextPid || nextPid === pid) break;
+      if (!nextPid || nextPid === pid || nextPid <= 1) break;
       pid = nextPid;
     }
   } catch {}
+  // 兜底：subprocess 内部的 stdout/stderr/env
+  if (process.stdout?.columns) return process.stdout.columns;
+  if (process.stderr?.columns) return process.stderr.columns;
+  if (process.env.COLUMNS && +process.env.COLUMNS > 0) return +process.env.COLUMNS;
   return 0;
 }
-// 预留 4 字符安全边距，避免 Claude Code 再截一次时误伤
-const rawWidth = detectTerminalWidth() || 100;
+// 宽度缓存 TTL=60s，避免每次渲染都跑 ps/stty 拖慢 statusLine
+const widthCachePath = (process.env.CLAUDE_CONFIG_DIR || `${homedir()}/.claude`) + '/plugins/claude-hud/width.cache';
+let cached = null;
+try {
+  const raw = readFileSync(widthCachePath, 'utf8').trim().split(',');
+  const w = parseInt(raw[0], 10);
+  const ts = parseInt(raw[1], 10);
+  if (w >= 60 && ts && Date.now() - ts < 60_000) cached = w;
+} catch {}
+
+let rawWidth;
+if (cached) {
+  rawWidth = cached;
+} else {
+  const detected = detectTerminalWidth();
+  let stale = 0;
+  try { stale = parseInt(readFileSync(widthCachePath, 'utf8').split(',')[0], 10) || 0; } catch {}
+  rawWidth = detected >= 60 ? detected : (stale >= 60 ? stale : 120);
+  if (detected >= 60) {
+    try { writeFileSync(widthCachePath, `${detected},${Date.now()}`); } catch {}
+  }
+}
 const termWidth = Math.max(40, rawWidth - 4);
-// 自适应分层：≥90 全量，<90 压缩
-const tier = rawWidth >= 90 ? 'full' : 'compact';
+
+  const line = `${new Date().toISOString()}  w=${rawWidth} h=${h} ppid=${process.ppid}\n`;
+  writeFileSync((process.env.CLAUDE_CONFIG_DIR || `${homedir()}/.claude`) + '/plugins/claude-hud/debug.log', line, { flag: 'a' });
+} catch {}
+// 自适应分层：≥80 全量，<80 压缩
+const tier = rawWidth >= 80 ? 'full' : 'compact';
 
 // 颜色调色板
 const C = {
@@ -405,8 +430,11 @@ const DAY = 86400_000;
 let cache = {};
 try { cache = JSON.parse(readFileSync(cachePath, 'utf8')); } catch {}
 
+// 新会话首次触发 → 强制刷新缓存；同一会话内走 24h 缓存
+const currentSid = meta.session_id || '';
+const sameSession = cache.lastSid === currentSid;
 let stats;
-if (cache.stats && cache.ts && Date.now() - cache.ts < DAY) {
+if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
   stats = cache.stats;
 } else {
   stats = { promptBuckets: {}, sessionBuckets: {}, globalPrompts: 0, globalSessions: 0 };
@@ -436,7 +464,7 @@ if (cache.stats && cache.ts && Date.now() - cache.ts < DAY) {
     };
     walk(projectsDir);
   }
-  try { writeFileSync(cachePath, JSON.stringify({ stats, ts: Date.now() })); } catch {}
+  try { writeFileSync(cachePath, JSON.stringify({ stats, ts: Date.now(), lastSid: currentSid })); } catch {}
 }
 
 // 聚合桶 → 今日/7日均/30日均
@@ -604,11 +632,11 @@ function renderSpeedLine() {
   const curColor = speeds.length === 0 ? C.dim : speedColor(current, peak);
   const avgColor = speedColor(sessionAvg, peak);
   const sessPeakColor = speedColor(sessionMax, peak);
-  // sparkline 独立成行，存到模块级 sparkLine
+  // sparkline 独立成行 = 当前速度 + sparkline
   if (tier === 'full' && speeds.length > 0) {
-    sparkLine = `   ${dim(spark)} ${dim(marker)}`;
+    sparkLine = `${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}  ${dim(spark)} ${dim(marker)}`;
   }
-  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')} ${dim('━━')} ${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}`;
+  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')}`;
 }
 
 // 5) 输出指令统计行
