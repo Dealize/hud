@@ -796,15 +796,15 @@ function renderSpeedLine() {
   if (speeds.length >= 3) {
     const recentAvg = speeds.slice(-3).reduce((a, b) => a + b, 0) / 3;
     const isIdle = current === 0;
-    const label = wrap(C.dim, 'API ');
+    const pre = wrap(C.dim, '当前共用人数');
     if (isIdle) {
-      apiTempStr = `🌡️ ${label}${wrap(C.dim, '待机')}`;
+      apiTempStr = `🌡️ ${pre}${wrap(C.dim, '未知')} ${wrap(C.dim, 'API')} ${wrap(C.dim, '待机')}`;
     } else {
       const ratio = sessionAvg > 0 ? recentAvg / sessionAvg : 1;
-      if (ratio >= 0.9)      apiTempStr = `🌡️ ${label}${wrap(C.brightGreen, '畅通')}`;
-      else if (ratio >= 0.6) apiTempStr = `🌡️ ${label}${wrap(C.brightCyan, '正常')}`;
-      else if (ratio >= 0.3) apiTempStr = `🌡️ ${label}${wrap(C.brightYellow, '拥挤')}`;
-      else                   apiTempStr = `🌡️ ${label}${wrap(C.red + C.bold, '爆满')}`;
+      if (ratio >= 0.9)      apiTempStr = `🌡️ ${pre}${wrap(C.brightGreen, '较少')} ${wrap(C.dim, 'API')} ${wrap(C.brightGreen, '畅通')}`;
+      else if (ratio >= 0.6) apiTempStr = `🌡️ ${pre}${wrap(C.brightCyan, '适中')} ${wrap(C.dim, 'API')} ${wrap(C.brightCyan, '正常')}`;
+      else if (ratio >= 0.3) apiTempStr = `🌡️ ${pre}${wrap(C.brightYellow, '较多')} ${wrap(C.dim, 'API')} ${wrap(C.brightYellow, '拥挤')}`;
+      else                   apiTempStr = `🌡️ ${pre}${wrap(C.red + C.bold, '爆满')} ${wrap(C.dim, 'API')} ${wrap(C.red + C.bold, '拥堵')}`;
     }
   }
 
@@ -886,7 +886,7 @@ if (tier === 'full') {
   ];
   const promptLine = `📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}`;
   const streakColor = streak >= 30 ? C.red + C.bold : streak >= 7 ? C.brightYellow : C.brightCyan;
-  const streakStr = `🔥 ${dim('连续')}${wrap(streakColor, String(streak))}${dim('天')} ${dim('最长')}${wrap(C.brightMagenta, String(maxStreak))}${dim('天')}`;
+  const streakStr = `🔥 ${dim('连续工作')} ${wrap(streakColor, String(streak))} ${dim('天')}`;
   process.stdout.write(rightAppend(promptLine, streakStr) + '\n');
 
   // 7. 💬 会话次数 + 右侧 📊 24h 热力图
