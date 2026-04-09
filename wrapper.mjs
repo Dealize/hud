@@ -139,6 +139,17 @@ function calcEntryCost(usage, modelKey) {
 
 const fmtUSD = (v) => v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v >= 100 ? `$${v.toFixed(0)}` : v >= 10 ? `$${v.toFixed(1)}` : `$${v.toFixed(2)}`;
 
+// ANSI 工具
+const stripAnsiGlobal = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+const visLen = s => stripAnsiGlobal(s).length;
+// 右侧追加：紧跟左内容后面用加粗分隔符拼接，超宽则丢弃右侧
+const rightAppend = (left, right) => {
+  if (!right) return left;
+  const sep = '\x1b[37m\x1b[1m ┃ \x1b[0m';
+  if (visLen(left) + 3 + visLen(right) > termWidth) return left;
+  return left + sep + right;
+};
+
 // ANSI-aware 截断：保留不可见转义序列，截断可见字符到 maxWidth
 function truncateLine(line, maxWidth) {
   let visible = 0;
@@ -415,6 +426,11 @@ if (pluginDir && bunPath) {
       for (const i of activityIdxs.slice().reverse()) lines.splice(i, 1);
     }
 
+    // ⏰ 当前时间右对齐到身份行
+    if (idIdx >= 0 && tier === 'full') {
+      lines[idIdx] = rightAppend(lines[idIdx], renderClock());
+    }
+
     // compact: 只留身份行，且把身份行削到只剩项目名（避免被截断成半个字）
     let finalLines = lines;
     if (tier === 'compact') {
@@ -477,10 +493,11 @@ function countSkills() {
 //    判定：有至少一条 isSidechain=false + user + 真文本（非 tool_result）
 function parseTranscript(file) {
   const prompts = [];
+  const hours = [];
   let totalCost = 0;
   const costByDate = {};
   let model = null;
-  if (!existsSync(file)) return { prompts, userCreatedTs: null, cost: 0, costByDate };
+  if (!existsSync(file)) return { prompts, hours, userCreatedTs: null, cost: 0, costByDate };
   let userCreatedTs = null;
   try {
     for (const line of readFileSync(file, 'utf8').split('\n')) {
@@ -507,10 +524,11 @@ function parseTranscript(file) {
         if (isToolResult || !isText) continue;
         if (!userCreatedTs) userCreatedTs = j.timestamp;
         prompts.push(j.timestamp);
+        if (j.timestamp) { try { hours.push(new Date(j.timestamp).getHours()); } catch {} }
       } catch {}
     }
   } catch {}
-  return { prompts, userCreatedTs, cost: totalCost, costByDate };
+  return { prompts, hours, userCreatedTs, cost: totalCost, costByDate };
 }
 
 const currentSessionParsed = meta.transcript_path ? parseTranscript(meta.transcript_path) : { prompts: [], cost: 0 };
@@ -530,7 +548,7 @@ let stats;
 if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
   stats = cache.stats;
 } else {
-  stats = { promptBuckets: {}, sessionBuckets: {}, costBuckets: {}, globalPrompts: 0, globalSessions: 0 };
+  stats = { promptBuckets: {}, sessionBuckets: {}, costBuckets: {}, hourBuckets: new Array(24).fill(0), globalPrompts: 0, globalSessions: 0 };
   const projectsDir = join(claudeDir, 'projects');
   if (existsSync(projectsDir)) {
     const walk = dir => {
@@ -540,7 +558,7 @@ if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
           const s = statSync(p);
           if (s.isDirectory()) walk(p);
           else if (name.endsWith('.jsonl')) {
-            const { prompts, userCreatedTs, costByDate } = parseTranscript(p);
+            const { prompts, hours, userCreatedTs, costByDate } = parseTranscript(p);
             if (!userCreatedTs || prompts.length < 3) continue;
             stats.globalPrompts += prompts.length;
             stats.globalSessions++;
@@ -553,6 +571,9 @@ if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
             stats.sessionBuckets[sd] = (stats.sessionBuckets[sd] || 0) + 1;
             for (const [d, c] of Object.entries(costByDate)) {
               stats.costBuckets[d] = (stats.costBuckets[d] || 0) + c;
+            }
+            for (const h of hours) {
+              stats.hourBuckets[h] = (stats.hourBuckets[h] || 0) + 1;
             }
           }
         } catch {}
@@ -628,6 +649,64 @@ for (const [d, c] of Object.entries(stats.costBuckets || {})) {
 monthlyCost += todayCostLive;
 const profitLoss = monthlyCost - SUBSCRIPTION_MONTHLY;
 
+// 🔥 连续天数 (Streak)
+function calcStreak() {
+  const merged = { ...stats.sessionBuckets };
+  const tk = localDate(new Date());
+  if (todaySessionsLive > 0) merged[tk] = todaySessionsLive;
+  const hasToday = (merged[tk] || 0) > 0;
+  let streak = 0;
+  const now = new Date();
+  for (let i = hasToday ? 0 : 1; i < 365; i++) {
+    const d = new Date(now); d.setDate(d.getDate() - i);
+    if ((merged[localDate(d)] || 0) > 0) streak++; else break;
+  }
+  return streak;
+}
+function calcMaxStreak() {
+  const merged = { ...stats.sessionBuckets };
+  const tk = localDate(new Date());
+  if (todaySessionsLive > 0) merged[tk] = todaySessionsLive;
+  const dates = Object.keys(merged).filter(d => merged[d] > 0).sort();
+  if (dates.length === 0) return 0;
+  let max = 1, cur = 1;
+  for (let i = 1; i < dates.length; i++) {
+    const diff = Math.round((new Date(dates[i]) - new Date(dates[i - 1])) / 86400000);
+    if (diff === 1) { cur++; if (cur > max) max = cur; } else { cur = 1; }
+  }
+  return max;
+}
+const streak = calcStreak();
+const maxStreak = calcMaxStreak();
+
+// 📊 24h 时段热力图
+function renderHeatmap() {
+  const hb = stats.hourBuckets || new Array(24).fill(0);
+  const maxH = Math.max(...hb, 1);
+  const blocks = '▁▂▃▄▅▆▇█';
+  // 找出峰值小时
+  let peakHour = 0;
+  for (let i = 1; i < 24; i++) { if (hb[i] > hb[peakHour]) peakHour = i; }
+  const bar = hb.map(v => {
+    if (v === 0) return wrap(C.dim, '░');
+    const idx = Math.max(0, Math.min(blocks.length - 1, Math.ceil((v / maxH) * blocks.length) - 1));
+    const color = v / maxH >= 0.7 ? C.brightYellow : v / maxH >= 0.3 ? C.brightCyan : C.blue;
+    return wrap(color, blocks[idx]);
+  }).join('');
+  return `${wrap(C.dim, '0h')}${bar}${wrap(C.dim, '23h')} ${wrap(C.dim, '峰值')}${wrap(C.brightYellow, String(peakHour) + 'h')}`;
+}
+
+// ⏰ 当前时间 + 🌙 深夜提醒
+function renderClock() {
+  const now = new Date();
+  const h = now.getHours(), m = String(now.getMinutes()).padStart(2, '0');
+  const time = `${h}:${m}`;
+  const isLate = h >= 0 && h < 6;
+  return isLate
+    ? `🌙 ${wrap(C.red + C.bold, time)} ${wrap(C.red, '夜深了，早点休息')}`
+    : `⏰ ${wrap(C.dim, time)}`;
+}
+
 // 本项目会话数
 let projectSessions = 0;
 const cwd = meta.workspace?.current_dir || meta.cwd;
@@ -647,8 +726,9 @@ if (cwd) {
 
 const thinking = '';
 
-// 5) token 速度 + sparkline（拆成两个返回值）
+// 5) token 速度 + sparkline（拆成两个返回值）+ 🌡️ API 体感温度
 let sparkLine = '';
+let apiTempStr = '';
 function renderSpeedLine() {
   if (!meta.transcript_path || !existsSync(meta.transcript_path)) return '';
   // 从 transcript 取 token 总量
@@ -712,6 +792,22 @@ function renderSpeedLine() {
   if (current > state.globalPeak) state.globalPeak = current;
   try { writeFileSync(statePath, JSON.stringify(state)); } catch {}
 
+  // 🌡️ API 体感温度
+  if (speeds.length >= 3) {
+    const recentAvg = speeds.slice(-3).reduce((a, b) => a + b, 0) / 3;
+    const isIdle = current === 0;
+    const label = wrap(C.dim, 'API ');
+    if (isIdle) {
+      apiTempStr = `🌡️ ${label}${wrap(C.dim, '待机')}`;
+    } else {
+      const ratio = sessionAvg > 0 ? recentAvg / sessionAvg : 1;
+      if (ratio >= 0.9)      apiTempStr = `🌡️ ${label}${wrap(C.brightGreen, '畅通')}`;
+      else if (ratio >= 0.6) apiTempStr = `🌡️ ${label}${wrap(C.brightCyan, '正常')}`;
+      else if (ratio >= 0.3) apiTempStr = `🌡️ ${label}${wrap(C.brightYellow, '拥挤')}`;
+      else                   apiTempStr = `🌡️ ${label}${wrap(C.red + C.bold, '爆满')}`;
+    }
+  }
+
   // 混合刻度：本会话 max 不到全局 peak 的 30% 就降级用本会话自己的刻度
   const useGlobal = state.globalPeak > 0 && sessionMax >= state.globalPeak * 0.3;
   const scaleMax = useGlobal ? state.globalPeak : sessionMax;
@@ -773,14 +869,14 @@ function trend(val, base) {
 }
 
 if (tier === 'full') {
-  // 4. ⚡ 速度（不带 sparkline）
+  // 4. ⚡ 速度 + 右侧 🌡️ API 体感温度
   const speedLine = renderSpeedLine();
-  if (speedLine) process.stdout.write(speedLine + '\n');
+  if (speedLine) process.stdout.write(rightAppend(speedLine, apiTempStr) + '\n');
 
   // 5. 🪙 tokens
   if (tokensLine) process.stdout.write(tokensLine + '\n');
 
-  // 6. 📝 对话次数
+  // 6. 📝 对话次数 + 右侧 🔥 连续天数
   const promptParts = [
     `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
     `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
@@ -788,9 +884,12 @@ if (tier === 'full') {
     `${lbl('30日均')} ${wrap(C.cyan, pAgg.avg30)}`,
     `${lbl('全部')} ${wrap(C.dim, globalCount)}`,
   ];
-  process.stdout.write(`📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}\n`);
+  const promptLine = `📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}`;
+  const streakColor = streak >= 30 ? C.red + C.bold : streak >= 7 ? C.brightYellow : C.brightCyan;
+  const streakStr = `🔥 ${dim('连续')}${wrap(streakColor, String(streak))}${dim('天')} ${dim('最长')}${wrap(C.brightMagenta, String(maxStreak))}${dim('天')}`;
+  process.stdout.write(rightAppend(promptLine, streakStr) + '\n');
 
-  // 7. 💬 会话次数
+  // 7. 💬 会话次数 + 右侧 📊 24h 热力图
   const sessParts = [
     `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
     `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
@@ -798,7 +897,9 @@ if (tier === 'full') {
     `${lbl('30日均')} ${wrap(C.cyan, sAgg.avg30)}`,
     `${lbl('全部')} ${wrap(C.dim, globalSessions)}`,
   ];
-  process.stdout.write(`💬 ${wrap(C.dim, '会话次数')}  ${sessParts.join(wrap(C.dim, ' · '))}\n`);
+  const sessLine = `💬 ${wrap(C.dim, '会话次数')}  ${sessParts.join(wrap(C.dim, ' · '))}`;
+  const heatmap = `📊 ${dim('活跃时段')} ${renderHeatmap()}`;
+  process.stdout.write(rightAppend(sessLine, heatmap) + '\n');
 
   // 8. sparkline 独立行
   if (sparkLine) process.stdout.write(sparkLine + '\n');
