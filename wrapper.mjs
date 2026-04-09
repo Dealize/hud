@@ -139,6 +139,11 @@ function calcEntryCost(usage, modelKey) {
 
 const fmtUSD = (v) => v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v >= 100 ? `$${v.toFixed(0)}` : v >= 10 ? `$${v.toFixed(1)}` : `$${v.toFixed(2)}`;
 
+// 中美假日集合（提前构建，供 renderClock 使用）
+const _curYear = new Date().getFullYear();
+const CN_HOLIDAYS = new Set([...buildCNHolidays(_curYear), ...buildCNHolidays(_curYear + 1)]);
+const US_HOLIDAYS = new Set([...buildUSHolidays(_curYear), ...buildUSHolidays(_curYear + 1)]);
+
 // ANSI 工具
 const stripAnsiGlobal = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 const visLen = s => stripAnsiGlobal(s).length;
@@ -426,9 +431,9 @@ if (pluginDir && bunPath) {
       for (const i of activityIdxs.slice().reverse()) lines.splice(i, 1);
     }
 
-    // ⏰ 当前时间右对齐到身份行
-    if (idIdx >= 0 && tier === 'full') {
-      lines[idIdx] = rightAppend(lines[idIdx], renderClock());
+    // ⏰ 当前时间 + 中美工作状态 → 追加到 🛠 工具行右侧
+    if (envIdx >= 0 && tier === 'full') {
+      lines[envIdx] = rightAppend(lines[envIdx], renderClock());
     }
 
     // compact: 只留身份行，且把身份行削到只剩项目名（避免被截断成半个字）
@@ -746,10 +751,6 @@ function buildCNHolidays(y) {
   }
   return s;
 }
-const _curYear = new Date().getFullYear();
-const CN_HOLIDAYS = new Set([...buildCNHolidays(_curYear), ...buildCNHolidays(_curYear + 1)]);
-const US_HOLIDAYS = new Set([...buildUSHolidays(_curYear), ...buildUSHolidays(_curYear + 1)]);
-
 function renderClock() {
   const now = new Date();
   const h = now.getHours(), m = String(now.getMinutes()).padStart(2, '0');
