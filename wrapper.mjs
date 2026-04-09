@@ -196,7 +196,7 @@ try {
 
 // 统计「当前任务」工具使用：从最近一条用户 prompt 开始，不回溯历史
 function countToolUsage() {
-  const result = { subagent: { running: 0, total: 0 }, tools: {} };
+  const result = { subagent: { running: 0, total: 0 }, tools: {}, bgShells: { running: 0, total: 0 } };
   if (!meta.transcript_path || !existsSync(meta.transcript_path)) return result;
 
   let entries = [];
@@ -242,6 +242,23 @@ function countToolUsage() {
       if (!isDone) result.tools[name].running++;
     }
   }
+
+  // 背景 shell：扫全 transcript（跨 turn 持久）
+  let bgStarted = 0, bgKilled = 0;
+  for (const line of entries) {
+    try {
+      const j = JSON.parse(line);
+      const content = j.message?.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (c?.type !== 'tool_use') continue;
+        if (c.name === 'Bash' && c.input?.run_in_background === true) bgStarted++;
+        if (c.name === 'KillShell' || c.name === 'KillBash') bgKilled++;
+      }
+    } catch {}
+  }
+  result.bgShells.total = bgStarted;
+  result.bgShells.running = Math.max(0, bgStarted - bgKilled);
   return result;
 }
 
@@ -277,10 +294,16 @@ if (pluginDir && bunPath) {
       const idParts = [];
       if (projectPart) idParts.push(`📁 ${wrap(C.brightCyan, projectPart)}`);
       if (sessionPart) idParts.push(wrap(C.dim, sessionPart));
-      if (timePart) {
-        // 3h 9m → 3:09，45m → 0:45
-        const hm = timePart.match(/(?:(\d+)h)?\s*(\d+)m/);
-        const fmt = hm ? `${hm[1] || '0'}:${String(hm[2]).padStart(2, '0')}` : timePart;
+      // 用 API 等待时间替代 wall-clock 时长
+      const apiMs = meta.cost?.total_api_duration_ms || 0;
+      if (apiMs > 0) {
+        const sec = Math.floor(apiMs / 1000);
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = sec % 60;
+        const fmt = h > 0
+          ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+          : `${m}:${String(s).padStart(2, '0')}`;
         idParts.push(`⏱  ${wrap(C.brightMagenta, fmt)}`);
       }
       if (modelPart) idParts.push(wrap(C.cyan, modelPart));
@@ -360,6 +383,8 @@ if (pluginDir && bunPath) {
       };
       const { running: sRunning, total: sTotal } = usage.subagent;
       if (sTotal > 0) prefixParts.push(renderTool('SubAgent', sRunning, sTotal));
+      const { running: bgRunning, total: bgTotal } = usage.bgShells;
+      if (bgTotal > 0) prefixParts.push(renderTool('BgShell', bgRunning, bgTotal));
       // 所有 mcp__ 工具合并成单个 mcp 桶
       const merged = {};
       for (const [name, stats] of Object.entries(usage.tools)) {
@@ -607,7 +632,7 @@ const profitLoss = monthlyCost - SUBSCRIPTION_MONTHLY;
 let projectSessions = 0;
 const cwd = meta.workspace?.current_dir || meta.cwd;
 if (cwd) {
-  const escaped = cwd.replace(/[\/\.]/g, '-');
+  const escaped = cwd.replace(/[\/\._]/g, '-');
   const projectDir = join(claudeDir, 'projects', escaped);
   if (existsSync(projectDir)) {
     try {
@@ -718,7 +743,7 @@ function renderSpeedLine() {
   if (tier === 'full' && speeds.length > 0) {
     sparkLine = `${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}  ${dim(spark)} ${dim(marker)}`;
   }
-  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/本峰')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')}`;
+  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/会话峰值')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')}`;
 }
 
 // 5) 输出指令统计行
