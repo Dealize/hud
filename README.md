@@ -8,10 +8,12 @@
 📁 hud │ 优化claude hub │ ⏱  2h 44m │ [Opus 4.6 (1M context)]
 ⏳  上下文 ░░░░░░░░░░ 19% │ 用量 ░░░ 13% 4h 31m │ 本周 ░░░░░ 49% 3d 23h
 🛠  3/5 SubAgent | 8/10 Edit | 1/2 Bash │ 4 MCPs | 7 钩子 | 46 技能
-📝 本次 97 · 今日 250 ↑↑ · 7日均 137 · 30日均 137 · 全部 4129
-💬 本项目 10 · 今日 6 ↓ · 7日均 7 ↓ · 30日均 9 · 全部 265
-⚡ 49/avg ｜ 75/本峰 ｜ 2035/史峰 ━━ 当前 31 tok/s  ░░░░░░▇▅█▅▃▇▇▄ ○
+⚡ 49/avg ｜ 75/本峰 ｜ 2035/史峰
 🪙 75.6M 总  in:1k  out:151k  cache:75.5M
+📝 对话次数  本次 97 · 今日 250 ↑↑ · 7日均 137 · 30日均 137 · 全部 4129
+💬 会话次数  本项目 10 · 今日 6 ↓ · 7日均 7 ↓ · 30日均 9 · 全部 265
+当前 31 tok/s  ░░░░░░▇▅█▅▃▇▇▄ ○
+💰 费用  本次 $3.42 · 今日 $28.50 · 本月 $156/$200 ████████░░ 78% · 赚 $43.20
 ```
 
 ## 功能
@@ -23,7 +25,8 @@
 - **会话统计**：本项目 · 今日 · 7 日均 · 30 日均 · 全部（只算有真人输入的 session）
 - **token 速度**：avg / 本峰 / 史峰 / 当前 + 字符 sparkline + 混合刻度
 - **token 总量**：total / in / out / cache 实时
-- **自适应宽度**：≥160 列全 7 行；120–159 折叠中等；<120 紧凑只留身份
+- **费用估算**：基于 Claude API 官方定价实时计算 token 费用，对比月订阅显示盈亏
+- **自适应宽度**：≥80 列全量显示；<80 紧凑只留身份
 - **24h 全局缓存**：扫一次全 transcript 缓存一天，开会话不卡
 
 ## 安装
@@ -79,10 +82,11 @@ HUD 应该出现在输入框下方。
 
 ## 配置
 
-显示开关在 `~/.claude/plugins/claude-hud/config.json`：
+配置文件在 `~/.claude/plugins/claude-hud/config.json`：
 
 ```json
 {
+  "subscription": 200,
   "lineLayout": "expanded",
   "language": "zh",
   "display": {
@@ -96,9 +100,40 @@ HUD 应该出现在输入框下方。
 }
 ```
 
-支持的字段见 [claude-hud 官方文档](https://github.com/jarrodwatts/claude-hud)。
+### 配置工具
+
+提供 `configure.sh` 快捷修改配置：
+
+```bash
+# 查看当前配置
+./configure.sh show
+
+# 设置月订阅金额（USD）
+./configure.sh subscription 200
+
+# 切换显示开关
+./configure.sh display showGit false
+
+# 设置任意配置项
+./configure.sh set language en
+```
+
+### 费用估算
+
+💰 费用行基于 [Claude API 官方定价](https://platform.claude.com/docs/about-claude/pricing) 实时计算 token 等价费用，并与月订阅对比盈亏：
+
+- **本次**：当前会话累计费用
+- **今日**：今日所有会话累计费用
+- **本月**：本月累计费用 / 订阅金额 + 进度条
+- **赚/亏**：本月 API 等价费用 − 订阅金额（绿色=省钱，红色=多付）
+
+支持全系列 Claude 模型自动检测定价，包含 input / output / cache read / cache write / >200K 长上下文溢价。
+
+`subscription` 默认 200（Max 订阅），可通过 `./configure.sh subscription <金额>` 或直接编辑 config.json 修改。
 
 修改后无需重启，下次 statusLine 触发渲染就生效。
+
+其他字段见 [claude-hud 官方文档](https://github.com/jarrodwatts/claude-hud)。
 
 ## 自定义提示
 
