@@ -696,15 +696,97 @@ function renderHeatmap() {
   return `${wrap(C.dim, '0h')}${bar}${wrap(C.dim, '23h')} ${wrap(C.brightYellow, String(peakHour) + '点')}${wrap(C.dim, '最忙')}`;
 }
 
-// ⏰ 当前时间 + 🌙 深夜提醒
+// ⏰ 当前时间 + 中美工作状态
+// 浮动美国假日计算
+function nthWeekday(year, month, weekday, n) {
+  const first = new Date(year, month, 1);
+  let date = 1 + ((weekday - first.getDay() + 7) % 7) + (n - 1) * 7;
+  return new Date(year, month, date);
+}
+function lastMonday(year, month) {
+  const last = new Date(year, month + 1, 0);
+  return new Date(year, month, last.getDate() - ((last.getDay() + 6) % 7));
+}
+function buildUSHolidays(y) {
+  const s = new Set();
+  const add = d => s.add(localDate(d));
+  add(new Date(y, 0, 1));  add(new Date(y, 5, 19)); add(new Date(y, 6, 4));
+  add(new Date(y, 10, 11)); add(new Date(y, 11, 25));
+  add(nthWeekday(y, 0, 1, 3));  // MLK
+  add(nthWeekday(y, 1, 1, 3));  // Presidents
+  add(lastMonday(y, 4));         // Memorial
+  add(nthWeekday(y, 8, 1, 1));  // Labor
+  add(nthWeekday(y, 9, 1, 2));  // Columbus
+  add(nthWeekday(y, 10, 4, 4)); // Thanksgiving
+  return s;
+}
+function buildCNHolidays(y) {
+  const s = new Set();
+  const addRange = (m, d1, d2) => { for (let d = d1; d <= d2; d++) s.add(localDate(new Date(y, m, d))); };
+  // 每年固定
+  s.add(localDate(new Date(y, 0, 1))); // 元旦
+  // 按年份的具体假期（国务院公布）
+  if (y === 2025) {
+    addRange(0, 28, 31); addRange(1, 1, 4); // 春节 1/28-2/4
+    addRange(3, 4, 6);   // 清明
+    addRange(4, 1, 5);   // 劳动节
+    addRange(4, 31, 31); addRange(5, 1, 2); // 端午
+    addRange(9, 1, 8);   // 中秋+国庆
+  } else if (y === 2026) {
+    addRange(0, 1, 3);   // 元旦
+    addRange(1, 17, 23); // 春节
+    addRange(3, 5, 7);   // 清明
+    addRange(4, 1, 5);   // 劳动节
+    addRange(5, 19, 21); // 端午
+    addRange(8, 25, 27); // 中秋
+    addRange(9, 1, 7);   // 国庆
+  } else {
+    // 兜底：只标主要固定节日
+    addRange(9, 1, 7); // 国庆
+  }
+  return s;
+}
+const _curYear = new Date().getFullYear();
+const CN_HOLIDAYS = new Set([...buildCNHolidays(_curYear), ...buildCNHolidays(_curYear + 1)]);
+const US_HOLIDAYS = new Set([...buildUSHolidays(_curYear), ...buildUSHolidays(_curYear + 1)]);
+
 function renderClock() {
   const now = new Date();
   const h = now.getHours(), m = String(now.getMinutes()).padStart(2, '0');
   const time = `${h}:${m}`;
   const isLate = h >= 0 && h < 6;
-  return isLate
+
+  // 中国时间（UTC+8）
+  const cnNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Shanghai' }));
+  const cnH = cnNow.getHours();
+  const cnDay = cnNow.getDay();
+  const cnDate = localDate(cnNow);
+  const cnHoliday = CN_HOLIDAYS.has(cnDate);
+  const cnWeekend = cnDay === 0 || cnDay === 6;
+  const cnWork = !cnHoliday && !cnWeekend && cnH >= 9 && cnH < 18;
+  const cnStatus = cnHoliday ? wrap(C.brightMagenta, '假期')
+    : cnWeekend ? wrap(C.dim, '周末')
+    : cnWork ? wrap(C.brightGreen, '上班')
+    : wrap(C.dim, '下班');
+
+  // 美国东部时间
+  const usNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const usH = usNow.getHours();
+  const usDay = usNow.getDay();
+  const usDate = localDate(usNow);
+  const usHoliday = US_HOLIDAYS.has(usDate);
+  const usWeekend = usDay === 0 || usDay === 6;
+  const usWork = !usHoliday && !usWeekend && usH >= 9 && usH < 18;
+  const usStatus = usHoliday ? wrap(C.brightMagenta, '假期')
+    : usWeekend ? wrap(C.dim, '周末')
+    : usWork ? wrap(C.brightGreen, '上班')
+    : wrap(C.dim, '下班');
+
+  const clock = isLate
     ? `🌙 ${wrap(C.red + C.bold, time)} ${wrap(C.red, '夜深了，早点休息')}`
-    : `⏰ ${wrap(C.dim, time)}`;
+    : `⏰ ${wrap(C.dim, '当地时间')} ${wrap(C.white + C.bold, time)}`;
+
+  return `${clock} ${wrap(C.dim, 'CN')}${cnStatus} ${wrap(C.dim, 'US')}${usStatus}`;
 }
 
 // 本项目会话数
