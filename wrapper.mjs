@@ -60,6 +60,8 @@ if (cached) {
 }
 const termWidth = Math.max(40, rawWidth - 4);
 
+try {
+  const h = process.stdout?.rows || 0;
   const line = `${new Date().toISOString()}  w=${rawWidth} h=${h} ppid=${process.ppid}\n`;
   writeFileSync((process.env.CLAUDE_CONFIG_DIR || `${homedir()}/.claude`) + '/plugins/claude-hud/debug.log', line, { flag: 'a' });
 } catch {}
@@ -92,6 +94,50 @@ const speedColor = (v, peak) => {
   const r = v / peak;
   return r >= 0.7 ? C.brightYellow : r >= 0.3 ? C.brightCyan : C.blue;
 };
+
+// API 定价（$/MTok）— https://platform.claude.com/docs/about-claude/pricing
+const PRICING = {
+  'opus-4.6':   { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, inputLong: 10, outputLong: 37.5 },
+  'opus-4.5':   { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, inputLong: 10, outputLong: 37.5 },
+  'opus-4.1':   { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  'opus-4':     { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+  'sonnet-4.6': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, inputLong: 6, outputLong: 22.5 },
+  'sonnet-4.5': { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75, inputLong: 6, outputLong: 22.5 },
+  'sonnet-4':   { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+  'haiku-4.5':  { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+  'haiku-3.5':  { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 },
+};
+
+function detectModelKey(str) {
+  if (!str) return 'opus-4.6';
+  const s = str.toLowerCase().replace(/[-_]/g, '.');
+  if (/opus.*4\.6/.test(s))   return 'opus-4.6';
+  if (/opus.*4\.5/.test(s))   return 'opus-4.5';
+  if (/opus.*4\.1/.test(s))   return 'opus-4.1';
+  if (/opus.*4(?!\.\d)/.test(s)) return 'opus-4';
+  if (/sonnet.*4\.6/.test(s)) return 'sonnet-4.6';
+  if (/sonnet.*4\.5/.test(s)) return 'sonnet-4.5';
+  if (/sonnet.*4(?!\.\d)/.test(s)) return 'sonnet-4';
+  if (/haiku.*4\.5/.test(s))  return 'haiku-4.5';
+  if (/haiku.*3\.5/.test(s))  return 'haiku-3.5';
+  return 'opus-4.6';
+}
+
+function calcEntryCost(usage, modelKey) {
+  const p = PRICING[modelKey] || PRICING['opus-4.6'];
+  const M = 1_000_000;
+  const inp = usage.input_tokens || 0;
+  const out = usage.output_tokens || 0;
+  const cacheRead = usage.cache_read_input_tokens || 0;
+  const cacheWrite = usage.cache_creation_input_tokens || 0;
+  const totalInput = inp + cacheRead + cacheWrite;
+  const isLong = totalInput > 200_000 && p.inputLong;
+  const inRate = isLong ? p.inputLong : p.input;
+  const outRate = isLong ? (p.outputLong || p.output) : p.output;
+  return (inp * inRate + out * outRate + cacheRead * p.cacheRead + cacheWrite * p.cacheWrite) / M;
+}
+
+const fmtUSD = (v) => v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v >= 100 ? `$${v.toFixed(0)}` : v >= 10 ? `$${v.toFixed(1)}` : `$${v.toFixed(2)}`;
 
 // ANSI-aware 截断：保留不可见转义序列，截断可见字符到 maxWidth
 function truncateLine(line, maxWidth) {
@@ -131,6 +177,12 @@ let meta = {};
 try { meta = JSON.parse(input); } catch {}
 
 const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+
+// 读取配置（subscription 可在 config.json 中自定义）
+const hudConfigPath = join(claudeDir, 'plugins/claude-hud/config.json');
+let hudConfig = {};
+try { hudConfig = JSON.parse(readFileSync(hudConfigPath, 'utf8')); } catch {}
+const SUBSCRIPTION_MONTHLY = hudConfig.subscription || 200;
 
 // 1) 跑原生 claude-hud
 const cacheDir = join(claudeDir, 'plugins/cache/claude-hud/claude-hud');
@@ -195,7 +247,7 @@ function countToolUsage() {
 
 let tokensLine = '';
 
-function findBun(){try{return require("child_process").execSync("command -v bun 2>/dev/null").toString().trim()||null}catch{}for(const p of ["/opt/homebrew/bin/bun","/usr/local/bin/bun",require("os").homedir()+"/.bun/bin/bun"]){if(require("fs").existsSync(p))return p}return null}
+function findBun(){try{return execSync("command -v bun 2>/dev/null").toString().trim()||null}catch{}for(const p of ["/opt/homebrew/bin/bun","/usr/local/bin/bun",homedir()+"/.bun/bin/bun"]){if(existsSync(p))return p}return null}
 const bunPath=findBun();
 
 if (pluginDir && bunPath) {
@@ -396,17 +448,31 @@ function countSkills() {
   return n;
 }
 
-// 2) 解析单文件：只统计「人工创建的 session」
+// 2) 解析单文件：只统计「人工创建的 session」+ 费用
 //    判定：有至少一条 isSidechain=false + user + 真文本（非 tool_result）
 function parseTranscript(file) {
   const prompts = [];
-  if (!existsSync(file)) return { prompts, userCreatedTs: null };
+  let totalCost = 0;
+  const costByDate = {};
+  let model = null;
+  if (!existsSync(file)) return { prompts, userCreatedTs: null, cost: 0, costByDate };
   let userCreatedTs = null;
   try {
     for (const line of readFileSync(file, 'utf8').split('\n')) {
       if (!line) continue;
       try {
         const j = JSON.parse(line);
+        // 检测模型
+        if (!model && j.message?.model) model = detectModelKey(j.message.model);
+        // 累计费用
+        const u = j.message?.usage;
+        if (u) {
+          const c = calcEntryCost(u, model || 'opus-4.6');
+          totalCost += c;
+          const d = j.timestamp ? localDate(j.timestamp) : localDate(new Date());
+          costByDate[d] = (costByDate[d] || 0) + c;
+        }
+        // 统计人工对话
         if (j.type !== 'user') continue;
         if (j.isSidechain === true) continue;  // 跳过 subagent 侧链
         const content = j.message?.content;
@@ -419,10 +485,12 @@ function parseTranscript(file) {
       } catch {}
     }
   } catch {}
-  return { prompts, userCreatedTs };
+  return { prompts, userCreatedTs, cost: totalCost, costByDate };
 }
 
-const sessionCount = meta.transcript_path ? parseTranscript(meta.transcript_path).prompts.length : 0;
+const currentSessionParsed = meta.transcript_path ? parseTranscript(meta.transcript_path) : { prompts: [], cost: 0 };
+const sessionCount = currentSessionParsed.prompts.length;
+const sessionCost = currentSessionParsed.cost;
 
 // 3) 全局统计（缓存 24h，包含按日桶）
 const cachePath = join(claudeDir, 'plugins/claude-hud/cache.json');
@@ -437,7 +505,7 @@ let stats;
 if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
   stats = cache.stats;
 } else {
-  stats = { promptBuckets: {}, sessionBuckets: {}, globalPrompts: 0, globalSessions: 0 };
+  stats = { promptBuckets: {}, sessionBuckets: {}, costBuckets: {}, globalPrompts: 0, globalSessions: 0 };
   const projectsDir = join(claudeDir, 'projects');
   if (existsSync(projectsDir)) {
     const walk = dir => {
@@ -447,7 +515,7 @@ if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
           const s = statSync(p);
           if (s.isDirectory()) walk(p);
           else if (name.endsWith('.jsonl')) {
-            const { prompts, userCreatedTs } = parseTranscript(p);
+            const { prompts, userCreatedTs, costByDate } = parseTranscript(p);
             if (!userCreatedTs || prompts.length < 3) continue;
             stats.globalPrompts += prompts.length;
             stats.globalSessions++;
@@ -458,6 +526,9 @@ if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
             }
             const sd = localDate(userCreatedTs);
             stats.sessionBuckets[sd] = (stats.sessionBuckets[sd] || 0) + 1;
+            for (const [d, c] of Object.entries(costByDate)) {
+              stats.costBuckets[d] = (stats.costBuckets[d] || 0) + c;
+            }
           }
         } catch {}
       }
@@ -495,7 +566,7 @@ const globalSessions = stats.globalSessions;
 // 今日数据实时计算（只扫今天 mtime 的文件）
 const todayStart = new Date();
 todayStart.setHours(0, 0, 0, 0);
-let todayPromptsLive = 0, todaySessionsLive = 0;
+let todayPromptsLive = 0, todaySessionsLive = 0, todayCostLive = 0;
 const projectsDirLive = join(claudeDir, 'projects');
 if (existsSync(projectsDirLive)) {
   const walk = dir => {
@@ -505,13 +576,14 @@ if (existsSync(projectsDirLive)) {
         const s = statSync(p);
         if (s.isDirectory()) walk(p);
         else if (name.endsWith('.jsonl') && s.mtime >= todayStart) {
-          const { prompts, userCreatedTs } = parseTranscript(p);
+          const { prompts, userCreatedTs, costByDate } = parseTranscript(p);
           if (!userCreatedTs || prompts.length < 3) continue;
           const todayStr = localDate(todayStart);
           for (const t of prompts) {
             if (t && localDate(t) === todayStr) todayPromptsLive++;
           }
           if (localDate(userCreatedTs) === todayStr) todaySessionsLive++;
+          todayCostLive += costByDate[todayStr] || 0;
         }
       } catch {}
     }
@@ -520,6 +592,16 @@ if (existsSync(projectsDirLive)) {
 }
 pAgg.today = todayPromptsLive;
 sAgg.today = todaySessionsLive;
+
+// 月度费用聚合：缓存中非今日 + 今日实时
+const todayStr = localDate(new Date());
+const monthPrefix = todayStr.slice(0, 7); // "YYYY-MM"
+let monthlyCost = 0;
+for (const [d, c] of Object.entries(stats.costBuckets || {})) {
+  if (d.startsWith(monthPrefix) && d !== todayStr) monthlyCost += c;
+}
+monthlyCost += todayCostLive;
+const profitLoss = monthlyCost - SUBSCRIPTION_MONTHLY;
 
 // 本项目会话数
 let projectSessions = 0;
@@ -695,10 +777,37 @@ if (tier === 'full') {
 
   // 8. sparkline 独立行
   if (sparkLine) process.stdout.write(sparkLine + '\n');
+
+  // 9. 💰 费用估算（API 等价费用 vs 订阅）
+  {
+    const plSign = profitLoss >= 0;
+    const plColor = plSign ? C.brightGreen : C.red;
+    const plLabel = plSign ? '赚' : '亏';
+    const plAbs = Math.abs(profitLoss);
+    const pctUsed = SUBSCRIPTION_MONTHLY > 0 ? Math.round((monthlyCost / SUBSCRIPTION_MONTHLY) * 100) : 0;
+    const barLen = 10;
+    const filled = Math.min(barLen, Math.round((pctUsed / 100) * barLen));
+    const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+    const barColor = pctUsed >= 100 ? C.brightGreen : pctUsed >= 70 ? C.brightYellow : C.dim;
+    const costParts = [
+      `${lbl('本次')} ${wrap(C.brightYellow, fmtUSD(sessionCost))}`,
+      `${lbl('今日')} ${wrap(C.brightYellow, fmtUSD(todayCostLive))}`,
+      `${lbl('本月')} ${wrap(C.brightYellow + C.bold, fmtUSD(monthlyCost))}${dim('/')}${dim(fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(threshColor(100 - pctUsed), pctUsed + '%')}`,
+      `${wrap(plColor + C.bold, plLabel)} ${wrap(plColor + C.bold, fmtUSD(plAbs))}`,
+    ];
+    process.stdout.write(`💰 ${wrap(C.dim, '费用')}  ${costParts.join(wrap(C.dim, ' · '))}\n`);
+  }
 } else if (tier === 'medium') {
   process.stdout.write(`📝 ${num(sessionCount, pAgg.avg7)}${dim('/')}${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}${dim('/')}${num(pAgg.avg7, pAgg.avg30)}${dim('/')}${dim(globalCount)} ${dim('│')} 💬 ${num(projectSessions, 5)}${dim('/')}${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}${dim('/')}${num(sAgg.avg7, sAgg.avg30)}${dim('/')}${dim(globalSessions)}\n`);
   const speedLine = renderSpeedLine();
   if (speedLine) process.stdout.write(speedLine + '\n');
   if (tokensLine) process.stdout.write(tokensLine + '\n');
+  // medium 模式下简化费用行
+  {
+    const plSign = profitLoss >= 0;
+    const plColor = plSign ? C.brightGreen : C.red;
+    const plLabel = plSign ? '赚' : '亏';
+    process.stdout.write(`💰 ${wrap(C.brightYellow, fmtUSD(sessionCost))}${dim('/')}${wrap(C.brightYellow, fmtUSD(todayCostLive))}${dim('/')}${wrap(C.brightYellow + C.bold, fmtUSD(monthlyCost))} ${wrap(plColor + C.bold, plLabel + fmtUSD(Math.abs(profitLoss)))}\n`);
+  }
 }
 // compact 不输出额外行（只保留 claude-hud 原生 + identity/env 行）
