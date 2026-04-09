@@ -693,7 +693,7 @@ function renderHeatmap() {
     const color = v / maxH >= 0.7 ? C.brightYellow : v / maxH >= 0.3 ? C.brightCyan : C.blue;
     return wrap(color, blocks[idx]);
   }).join('');
-  return `${wrap(C.dim, '0h')}${bar}${wrap(C.dim, '23h')} ${wrap(C.dim, '峰值')}${wrap(C.brightYellow, String(peakHour) + 'h')}`;
+  return `${wrap(C.dim, '0h')}${bar}${wrap(C.dim, '23h')} ${wrap(C.brightYellow, String(peakHour) + '点')}${wrap(C.dim, '最忙')}`;
 }
 
 // ⏰ 当前时间 + 🌙 深夜提醒
