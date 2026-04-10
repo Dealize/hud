@@ -247,19 +247,17 @@ function countToolUsage() {
     } catch {}
   }
 
+  // 当前 turn 的普通工具
   for (const [id, name] of idToName) {
     const isDone = finished.has(id);
-    if (name === 'Task' || name === 'Agent') {
-      result.subagent.total++;
-      if (!isDone) result.subagent.running++;
-    } else {
-      if (!result.tools[name]) result.tools[name] = { running: 0, total: 0 };
-      result.tools[name].total++;
-      if (!isDone) result.tools[name].running++;
-    }
+    if (name === 'Task' || name === 'Agent') continue; // SubAgent 改为全 transcript 统计
+    if (!result.tools[name]) result.tools[name] = { running: 0, total: 0 };
+    result.tools[name].total++;
+    if (!isDone) result.tools[name].running++;
   }
 
-  // 背景 shell：扫全 transcript（跨 turn 持久）
+  // SubAgent + 背景 shell：扫全 transcript（跨 turn 持久）
+  const agentIds = new Map(); // id → done?
   let bgStarted = 0, bgKilled = 0;
   for (const line of entries) {
     try {
@@ -267,11 +265,20 @@ function countToolUsage() {
       const content = j.message?.content;
       if (!Array.isArray(content)) continue;
       for (const c of content) {
-        if (c?.type !== 'tool_use') continue;
-        if (c.name === 'Bash' && c.input?.run_in_background === true) bgStarted++;
-        if (c.name === 'KillShell' || c.name === 'KillBash') bgKilled++;
+        if (c?.type === 'tool_use') {
+          if ((c.name === 'Task' || c.name === 'Agent') && c.id) agentIds.set(c.id, false);
+          if (c.name === 'Bash' && c.input?.run_in_background === true) bgStarted++;
+          if (c.name === 'KillShell' || c.name === 'KillBash') bgKilled++;
+        }
+        if (c?.type === 'tool_result' && c.tool_use_id && agentIds.has(c.tool_use_id)) {
+          agentIds.set(c.tool_use_id, true);
+        }
       }
     } catch {}
+  }
+  for (const done of agentIds.values()) {
+    result.subagent.total++;
+    if (!done) result.subagent.running++;
   }
   result.bgShells.total = bgStarted;
   result.bgShells.running = Math.max(0, bgStarted - bgKilled);
@@ -308,7 +315,7 @@ if (pluginDir && bunPath) {
         else if (!sessionPart) sessionPart = s;
       }
       const idParts = [];
-      if (projectPart) idParts.push(`📁 ${wrap(C.brightCyan, projectPart)}`);
+      if (projectPart) idParts.push(`📁 ${wrap(C.dim, '项目')}  ${wrap(C.brightCyan, projectPart)}`);
       if (sessionPart) idParts.push(wrap(C.dim, sessionPart));
       // 当前 turn 的 API 等待时间（差分计算）
       const totalApiMs = meta.cost?.total_api_duration_ms || 0;
@@ -357,19 +364,94 @@ if (pluginDir && bunPath) {
         .replace(/\(\s*resets?\s+in\s+([^)]+?)\s*\)/gi, (_, t) => wrap(C.dim, fmtHM(t)));
     }
 
-    // 给上下文/用量/本周行加 ⏳ 前缀，并按阈值染色所有百分比
+    // 上下文进度条：50% real = 100% visual，染色按质量线
+    const contextThresh = (pct) => pct >= 50 ? C.red + C.bold : pct >= 45 ? C.red : pct >= 40 ? C.brightYellow : pct >= 25 ? C.brightCyan : C.green;
+    const rescaleContextBar = (line) => {
+      // 重绘上下文进度条：把 50% 映射成满格
+      const s = stripAnsi(line);
+      const m = s.match(/上下文.*?(\d+(?:\.\d+)?)\s*%/);
+      if (!m) return line;
+      const realPct = parseFloat(m[1]);
+      const effectivePct = Math.min(100, Math.round(realPct * 2)); // 50% real = 100%
+      const barLen = 10;
+      const filled = Math.min(barLen, Math.round((effectivePct / 100) * barLen));
+      const barColor = contextThresh(realPct);
+      const bar = wrap(barColor, '█'.repeat(filled)) + wrap(C.dim, '░'.repeat(barLen - filled));
+      // 替换原有进度条和百分比
+      return line
+        .replace(/[░▓█▁▂▃▄▅▆▇]+/g, '') // 去掉原 bar
+        .replace(new RegExp(`${m[1]}\\s*%`), `${bar} ${wrap(barColor + C.bold, realPct + '%')}`);
+    };
     const recolorAllPct = (line) => {
-      // 染所有 N% 数字
       return line.replace(/(\d+(?:\.\d+)?)\s*%/g, (_, n) => {
         const pct = parseFloat(n);
         return wrap(threshColor(pct) + C.bold, `${n}%`);
       });
     };
+
+    // 估算剩余可用轮数
+    let remainTurnsStr = '';
+    {
+      const ctxPct = meta.context_window?.used_percentage || 0;
+      const ctxSize = meta.context_window?.context_window_size || 0;
+      if (ctxPct >= 10 && ctxSize > 0 && meta.transcript_path && existsSync(meta.transcript_path)) {
+        // 计算最近 10 轮每轮 token 消耗中位数
+        const tLines = readFileSync(meta.transcript_path, 'utf8').split('\n').filter(Boolean);
+        const turnTokens = [];
+        let turnStart = 0;
+        let inTurn = false;
+        for (const line of tLines) {
+          try {
+            const j = JSON.parse(line);
+            if (j.type === 'user' && j.isSidechain !== true) {
+              const c = j.message?.content;
+              const isTR = Array.isArray(c) && c.some(x => x?.type === 'tool_result');
+              const isText = typeof c === 'string' || (Array.isArray(c) && c.some(x => x?.type === 'text'));
+              if (!isTR && isText) { turnStart = 0; inTurn = true; }
+            }
+            if (inTurn && j.message?.usage) {
+              const u = j.message.usage;
+              // 只算 output + cache_creation（真正新增到 context 的部分）
+              turnStart += (u.output_tokens || 0) + (u.cache_creation_input_tokens || 0);
+            }
+            // turn 结束：assistant 有 stop_reason
+            if (inTurn && j.type === 'assistant' && j.message?.stop_reason === 'end_turn') {
+              if (turnStart > 0) turnTokens.push(turnStart);
+              turnStart = 0;
+              inTurn = false;
+            }
+          } catch {}
+        }
+        if (turnTokens.length >= 5) {
+          const recent = turnTokens.slice(-10);
+          const sorted = [...recent].sort((a, b) => a - b);
+          const median = sorted[Math.floor(sorted.length / 2)];
+          const remaining = Math.max(0, (50 - ctxPct) / 100 * ctxSize);
+          const estTurns = median > 0 ? Math.floor(remaining / median) : 0;
+          if (ctxPct >= 50) {
+            remainTurnsStr = wrap(C.red + C.bold, ' 已超质量线 建议新开');
+          } else if (ctxPct >= 45) {
+            remainTurnsStr = `${wrap(C.red, ` ~剩${estTurns}轮`)} ${wrap(C.red + C.bold, '建议新开')}`;
+          } else if (ctxPct >= 40) {
+            remainTurnsStr = wrap(C.brightYellow, ` ~剩${estTurns}轮`);
+          } else {
+            remainTurnsStr = wrap(C.dim, ` ~剩${estTurns}轮`);
+          }
+        }
+      }
+    }
+
     for (let i = 0; i < lines.length; i++) {
-      if (i === idIdx) continue;  // 跳过身份行
+      if (i === idIdx) continue;
       const s = stripAnsi(lines[i]);
-      if (/上下文|context|用量|usage|本周|weekly/i.test(s)) {
-        lines[i] = `⏳  ${recolorAllPct(lines[i])}`;
+      if (/上下文|context/i.test(s) && !/用量|usage|本周|weekly/i.test(s)) {
+        // 纯上下文行：重绘 bar + 追加剩余轮数
+        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${rescaleContextBar(lines[i])}${remainTurnsStr}`;
+      } else if (/上下文.*用量|上下文.*本周/i.test(s) || /context.*usage/i.test(s)) {
+        // 合并行（上下文 + 用量 + 本周）：上下文部分重绘，其他保留
+        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${rescaleContextBar(recolorAllPct(lines[i]))}${remainTurnsStr}`;
+      } else if (/用量|usage|本周|weekly/i.test(s)) {
+        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${recolorAllPct(lines[i])}`;
       }
     }
 
@@ -381,7 +463,7 @@ if (pluginDir && bunPath) {
       const m = raw.match(new RegExp(`Tokens\\s+${N}\\s*\\(in:\\s*${N},\\s*out:\\s*${N}(?:,\\s*cache:\\s*${N})?`));
       if (m) {
         const [, total, inTok, outTok, cacheTok] = m;
-        tokensLine = `🪙 ${wrap(C.brightYellow + C.bold, total)} ${wrap(C.dim, '总')}  ${wrap(C.dim, 'in:')}${wrap(C.cyan, inTok)}  ${wrap(C.dim, 'out:')}${wrap(C.green, outTok)}${cacheTok ? `  ${wrap(C.dim, 'cache:')}${wrap(C.brightMagenta, cacheTok)}` : ''}`;
+        tokensLine = `🪙 ${wrap(C.dim, 'Token')}  ${wrap(C.brightYellow + C.bold, total)} ${wrap(C.dim, '总')}  ${wrap(C.dim, 'in:')}${wrap(C.cyan, inTok)}  ${wrap(C.dim, 'out:')}${wrap(C.green, outTok)}${cacheTok ? `  ${wrap(C.dim, 'cache:')}${wrap(C.brightMagenta, cacheTok)}` : ''}`;
       }
       lines.splice(tokIdx, 1);
     }
@@ -436,15 +518,12 @@ if (pluginDir && bunPath) {
       if (hooksM) envParts.push(`${wrap(C.brightCyan, hooksM[1])} ${wrap(C.dim, '钩子')}`);
       envParts.push(`${wrap(C.brightCyan, String(skills))} ${wrap(C.dim, '技能')}`);
 
-      lines[envIdx] = `🛠  ${prefix}${envParts.join(sep)}`;
+      lines[envIdx] = `🛠  ${wrap(C.dim, '工具')}  ${prefix}${envParts.join(sep)}`;
       // 删除 claude-hud 自带的活动行
       for (const i of activityIdxs.slice().reverse()) lines.splice(i, 1);
     }
 
-    // ⏰ 当前时间 + 中美工作状态 → 追加到 🛠 工具行右侧
-    if (envIdx >= 0 && tier === 'full') {
-      lines[envIdx] = rightAppend(lines[envIdx], renderClock());
-    }
+    // ⏰ 时钟不再追加到工具行（改到速度行右侧）
 
     // compact: 只留身份行，且把身份行削到只剩项目名（避免被截断成半个字）
     let finalLines = lines;
@@ -563,7 +642,7 @@ let stats;
 if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
   stats = cache.stats;
 } else {
-  stats = { promptBuckets: {}, sessionBuckets: {}, costBuckets: {}, hourBuckets: new Array(24).fill(0), globalPrompts: 0, globalSessions: 0 };
+  stats = { promptBuckets: {}, sessionBuckets: {}, costBuckets: {}, hourBuckets: new Array(24).fill(0), weekdayBuckets: new Array(7).fill(0), globalPrompts: 0, globalSessions: 0 };
   const projectsDir = join(claudeDir, 'projects');
   if (existsSync(projectsDir)) {
     const walk = dir => {
@@ -589,6 +668,11 @@ if (cache.stats && cache.ts && sameSession && Date.now() - cache.ts < DAY) {
             }
             for (const h of hours) {
               stats.hourBuckets[h] = (stats.hourBuckets[h] || 0) + 1;
+            }
+            for (const t of prompts) {
+              if (!t) continue;
+              const dow = new Date(t).getDay();
+              stats.weekdayBuckets[dow] = (stats.weekdayBuckets[dow] || 0) + 1;
             }
           }
         } catch {}
@@ -711,6 +795,33 @@ function renderHeatmap() {
   return `${wrap(C.dim, '0h')}${bar}${wrap(C.dim, '23h')} ${wrap(C.brightYellow, String(peakHour) + '点')}${wrap(C.dim, '最忙')}`;
 }
 
+// 📅 近14天活跃热力图（滚动）
+function renderWeeklyHeatmap() {
+  const now = new Date();
+  const dayNames = ['日', '一', '二', '三', '四', '五', '六'];
+  const blocks = '▁▂▃▄▅▆▇█';
+  const days = [];
+  // 合并 promptBuckets 做每日总量
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = localDate(d);
+    days.push({ count: (stats.promptBuckets || {})[key] || 0, dow: d.getDay() });
+  }
+  const maxD = Math.max(...days.map(d => d.count), 1);
+  let peakIdx = 0;
+  for (let i = 1; i < days.length; i++) { if (days[i].count > days[peakIdx].count) peakIdx = i; }
+  const bar = days.map(({ count }) => {
+    if (count === 0) return wrap(C.dim, '░');
+    const idx = Math.max(0, Math.min(blocks.length - 1, Math.ceil((count / maxD) * blocks.length) - 1));
+    const color = count / maxD >= 0.7 ? C.brightYellow : count / maxD >= 0.3 ? C.brightCyan : C.blue;
+    return wrap(color, blocks[idx]);
+  }).join('');
+  const peakDay = new Date(now); peakDay.setDate(peakDay.getDate() - (13 - peakIdx));
+  const peakLabel = `周${dayNames[peakDay.getDay()]}`;
+  return `${bar} ${wrap(C.brightYellow, peakLabel)}${wrap(C.dim, '最忙')}`;
+}
+
 // ⏰ 当前时间 + 中美工作状态
 // 浮动美国假日计算
 function nthWeekday(year, month, weekday, n) {
@@ -780,7 +891,7 @@ function renderClock() {
     : cnWork ? wrap(C.brightGreen, '上班')
     : wrap(C.dim, '下班');
 
-  // 美国东部时间
+  // 美国东部时间 → 反映 API 拥挤程度
   const usNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const usH = usNow.getHours();
   const usDay = usNow.getDay();
@@ -788,16 +899,34 @@ function renderClock() {
   const usHoliday = US_HOLIDAYS.has(usDate);
   const usWeekend = usDay === 0 || usDay === 6;
   const usWork = !usHoliday && !usWeekend && usH >= 9 && usH < 18;
-  const usStatus = usHoliday ? wrap(C.brightMagenta, '假期')
-    : usWeekend ? wrap(C.dim, '周末')
-    : usWork ? wrap(C.brightGreen, '上班')
-    : wrap(C.dim, '下班');
+  // US 工作时段 = Claude 高峰期（用户多 → API 可能变慢）
+  const usPeak = !usHoliday && !usWeekend && usH >= 9 && usH < 12;  // 美东上午最忙
+  const usActive = usWork && !usPeak;
+
+  let usLabel;
+  if (usHoliday) {
+    usLabel = wrap(C.brightGreen, '放假');
+  } else if (usWeekend) {
+    usLabel = wrap(C.brightGreen, '周末');
+  } else if (usH >= 9 && usH < 10) {
+    usLabel = wrap(C.red + C.bold, '刚上班');
+  } else if (usH >= 10 && usH < 12) {
+    usLabel = wrap(C.red, '上午忙');
+  } else if (usH >= 12 && usH < 14) {
+    usLabel = wrap(C.brightYellow, '午休');
+  } else if (usH >= 14 && usH < 18) {
+    usLabel = wrap(C.brightYellow, '下午忙');
+  } else if (usH >= 18 && usH < 20) {
+    usLabel = wrap(C.brightCyan, '刚下班');
+  } else {
+    usLabel = wrap(C.brightGreen, '没上班');
+  }
 
   const clock = isLate
     ? `🌙 ${wrap(C.red + C.bold, time)} ${wrap(C.red, '夜深了，早点休息')}`
-    : `⏰ ${wrap(C.dim, '当地时间')} ${wrap(C.white + C.bold, time)}`;
+    : `⏰ ${wrap(C.white + C.bold, time)}`;
 
-  return `${clock} ${wrap(C.dim, 'CN')}${cnStatus} ${wrap(C.dim, 'US')}${usStatus}`;
+  return `${clock} ${wrap(C.dim, 'US')}${usLabel}`;
 }
 
 // 本项目会话数
@@ -885,20 +1014,41 @@ function renderSpeedLine() {
   if (current > state.globalPeak) state.globalPeak = current;
   try { writeFileSync(statePath, JSON.stringify(state)); } catch {}
 
-  // 🌡️ API 体感温度
-  if (speeds.length >= 3) {
-    const recentAvg = speeds.slice(-3).reduce((a, b) => a + b, 0) / 3;
-    const isIdle = current === 0;
-    const pre = wrap(C.dim, '当前共用人数');
-    if (isIdle) {
-      apiTempStr = `🌡️ ${pre}${wrap(C.dim, '未知')} ${wrap(C.dim, 'API')} ${wrap(C.dim, '待机')}`;
-    } else {
-      const ratio = sessionAvg > 0 ? recentAvg / sessionAvg : 1;
-      if (ratio >= 0.9)      apiTempStr = `🌡️ ${pre}${wrap(C.brightGreen, '较少')} ${wrap(C.dim, 'API')} ${wrap(C.brightGreen, '畅通')}`;
-      else if (ratio >= 0.6) apiTempStr = `🌡️ ${pre}${wrap(C.brightCyan, '适中')} ${wrap(C.dim, 'API')} ${wrap(C.brightCyan, '正常')}`;
-      else if (ratio >= 0.3) apiTempStr = `🌡️ ${pre}${wrap(C.brightYellow, '较多')} ${wrap(C.dim, 'API')} ${wrap(C.brightYellow, '拥挤')}`;
-      else                   apiTempStr = `🌡️ ${pre}${wrap(C.red + C.bold, '爆满')} ${wrap(C.dim, 'API')} ${wrap(C.red + C.bold, '拥堵')}`;
-    }
+  // 🌡️ TTFT 体感：最近 20 次中位数做基线，对比最新值
+  if (meta.transcript_path && existsSync(meta.transcript_path)) {
+    try {
+      const tLines = readFileSync(meta.transcript_path, 'utf8').split('\n').filter(Boolean);
+      const ttfts = [];
+      let lastUserTs = null;
+      for (const line of tLines) {
+        try {
+          const j = JSON.parse(line);
+          if (j.type === 'user' && j.isSidechain !== true) {
+            const c = j.message?.content;
+            const isText = typeof c === 'string' || (Array.isArray(c) && c.some(x => x?.type === 'text'));
+            const isTR = Array.isArray(c) && c.some(x => x?.type === 'tool_result');
+            if (isText && !isTR && j.timestamp) lastUserTs = new Date(j.timestamp).getTime();
+          }
+          if (j.type === 'assistant' && lastUserTs && j.timestamp) {
+            const aTs = new Date(j.timestamp).getTime();
+            const delta = aTs - lastUserTs;
+            if (delta > 0 && delta < 300_000) { ttfts.push(delta); lastUserTs = null; }
+          }
+        } catch {}
+      }
+      if (ttfts.length >= 5) {
+        const window = ttfts.slice(-20);
+        const sorted = [...window].sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length / 2)];
+        const latest = ttfts[ttfts.length - 1];
+        const ratio = median > 0 ? latest / median : 1;
+        const latestSec = (latest / 1000).toFixed(1);
+        if (ratio <= 1.5)      apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightGreen, '畅通')}`;
+        else if (ratio <= 2.0) apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightCyan, '正常')}`;
+        else if (ratio <= 3.0) apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightYellow, '偏慢')}`;
+        else                   apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.red + C.bold, '拥堵')}`;
+      }
+    } catch {}
   }
 
   // 混合刻度：本会话 max 不到全局 peak 的 30% 就降级用本会话自己的刻度
@@ -932,7 +1082,7 @@ function renderSpeedLine() {
   if (tier === 'full' && speeds.length > 0) {
     sparkLine = `${dim('当前')} ${wrap(curColor + C.bold, currentStr)} ${dim('tok/s')}  ${dim(spark)} ${dim(marker)}`;
   }
-  return `⚡ ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/会话峰值')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')}`;
+  return `📈 ${wrap(C.dim, '速度')}  ${wrap(avgColor, sessionAvg.toFixed(0))}${dim('/avg')} ${dim('｜')} ${wrap(sessPeakColor, sessionMax.toFixed(0))}${dim('/会话峰值')} ${dim('｜')} ${wrap(C.brightMagenta, peak.toFixed(0))}${dim('/史峰')}`;
 }
 
 // 5) 输出指令统计行
@@ -962,42 +1112,17 @@ function trend(val, base) {
 }
 
 if (tier === 'full') {
-  // 4. ⚡ 速度 + 右侧 🌡️ API 体感温度
+  // 4. ⚡ 速度 + 🌡️ 响应 + ⏰ 时钟/US
   const speedLine = renderSpeedLine();
-  if (speedLine) process.stdout.write(rightAppend(speedLine, apiTempStr) + '\n');
+  const clockStr = renderClock();
+  const speedRight = [apiTempStr, clockStr].filter(Boolean).join(wrap(C.dim, ' │ '));
+  if (speedLine) process.stdout.write(rightAppend(speedLine, speedRight) + '\n');
 
-  // 5. 🪙 tokens
+  // 5. 🪙 tokens + 💰 费用
+  // (费用在 tokens 之后输出，先收集 tokens)
   if (tokensLine) process.stdout.write(tokensLine + '\n');
 
-  // 6. 📝 对话次数 + 右侧 🔥 连续天数
-  const promptParts = [
-    `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
-    `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
-    `${lbl('7日均')} ${num(pAgg.avg7, pAgg.avg30)}${trend(pAgg.avg7, pAgg.avg30)}`,
-    `${lbl('30日均')} ${wrap(C.cyan, pAgg.avg30)}`,
-    `${lbl('全部')} ${wrap(C.dim, globalCount)}`,
-  ];
-  const promptLine = `📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}`;
-  const streakColor = streak >= 30 ? C.red + C.bold : streak >= 7 ? C.brightYellow : C.brightCyan;
-  const streakStr = `🔥 ${dim('连续工作')} ${wrap(streakColor, String(streak))} ${dim('天')}`;
-  process.stdout.write(rightAppend(promptLine, streakStr) + '\n');
-
-  // 7. 💬 会话次数 + 右侧 📊 24h 热力图
-  const sessParts = [
-    `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
-    `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
-    `${lbl('7日均')} ${num(sAgg.avg7, sAgg.avg30)}${trend(sAgg.avg7, sAgg.avg30)}`,
-    `${lbl('30日均')} ${wrap(C.cyan, sAgg.avg30)}`,
-    `${lbl('全部')} ${wrap(C.dim, globalSessions)}`,
-  ];
-  const sessLine = `💬 ${wrap(C.dim, '会话次数')}  ${sessParts.join(wrap(C.dim, ' · '))}`;
-  const heatmap = `📊 ${dim('活跃时段')} ${renderHeatmap()}`;
-  process.stdout.write(rightAppend(sessLine, heatmap) + '\n');
-
-  // 8. sparkline 独立行
-  if (sparkLine) process.stdout.write(sparkLine + '\n');
-
-  // 9. 💰 费用估算（API 等价费用 vs 订阅）
+  // 5b. 💰 费用（紧跟 tokens 下方）
   {
     const plSign = profitLoss >= 0;
     const plColor = plSign ? C.brightGreen : C.red;
@@ -1011,11 +1136,40 @@ if (tier === 'full') {
     const costParts = [
       `${lbl('本次')} ${wrap(C.brightYellow, fmtUSD(sessionCost))}`,
       `${lbl('今日')} ${wrap(C.brightYellow, fmtUSD(todayCostLive))}`,
-      `${lbl('本月')} ${wrap(C.brightYellow + C.bold, fmtUSD(monthlyCost))}${dim('/')}${dim(fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(threshColor(100 - pctUsed), pctUsed + '%')}`,
-      `${wrap(plColor + C.bold, plLabel)} ${wrap(plColor + C.bold, fmtUSD(plAbs))}`,
+      `${lbl('本月')} ${wrap(C.brightYellow, fmtUSD(monthlyCost))}/${wrap(C.dim, fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(barColor, pctUsed + '%')}`,
+      `${wrap(plColor, plLabel)} ${wrap(plColor, fmtUSD(plAbs))}`,
     ];
     process.stdout.write(`💰 ${wrap(C.dim, '费用')}  ${costParts.join(wrap(C.dim, ' · '))}\n`);
   }
+
+  // 6. 📝 对话次数
+  const promptParts = [
+    `${lbl('本次')} ${wrap(C.brightCyan, sessionCount)}`,
+    `${lbl('今日')} ${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}`,
+    `${lbl('7日均')} ${num(pAgg.avg7, pAgg.avg30)}${trend(pAgg.avg7, pAgg.avg30)}`,
+    `${lbl('30日均')} ${wrap(C.cyan, pAgg.avg30)}`,
+    `${lbl('全部')} ${wrap(C.dim, globalCount)}`,
+  ];
+  const promptLine = `📝 ${wrap(C.dim, '对话次数')}  ${promptParts.join(wrap(C.dim, ' · '))}`;
+  // 7. 💬 会话次数
+  const sessParts = [
+    `${lbl('本项目')} ${wrap(C.brightCyan, projectSessions)}`,
+    `${lbl('今日')} ${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}`,
+    `${lbl('7日均')} ${num(sAgg.avg7, sAgg.avg30)}${trend(sAgg.avg7, sAgg.avg30)}`,
+    `${lbl('30日均')} ${wrap(C.cyan, sAgg.avg30)}`,
+    `${lbl('全部')} ${wrap(C.dim, globalSessions)}`,
+  ];
+  const sessLine = `💬 ${wrap(C.dim, '会话次数')}  ${sessParts.join(wrap(C.dim, ' · '))}`;
+  process.stdout.write(`${promptLine}\n`);
+  process.stdout.write(`${sessLine}\n`);
+
+  // 8. 🔥 连续工作 + 📊 日活跃 + 📅 周活跃
+  const streakColor = streak >= 30 ? C.red + C.bold : streak >= 7 ? C.brightYellow : C.brightCyan;
+  const streakStr = `🔥 ${dim('连续工作')} ${wrap(streakColor, String(streak))} ${dim('天')}`;
+  const heatmap = `📊 ${dim('日活跃')} ${renderHeatmap()}`;
+  const weeklyHeatmap = `📅 ${dim('周活跃')} ${renderWeeklyHeatmap()}`;
+  process.stdout.write(`${streakStr} ${wrap(C.dim, '│')} ${heatmap} ${wrap(C.dim, '│')} ${weeklyHeatmap}\n`);
+
 } else if (tier === 'medium') {
   process.stdout.write(`📝 ${num(sessionCount, pAgg.avg7)}${dim('/')}${num(pAgg.today, pAgg.avg7)}${trend(pAgg.today, pAgg.avg7)}${dim('/')}${num(pAgg.avg7, pAgg.avg30)}${dim('/')}${dim(globalCount)} ${dim('│')} 💬 ${num(projectSessions, 5)}${dim('/')}${num(sAgg.today, sAgg.avg7)}${trend(sAgg.today, sAgg.avg7)}${dim('/')}${num(sAgg.avg7, sAgg.avg30)}${dim('/')}${dim(globalSessions)}\n`);
   const speedLine = renderSpeedLine();
