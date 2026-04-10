@@ -1,5 +1,6 @@
 {
   "subscription": 200,
+  "subscriptionExpiration": "2026-05-09",
   "lineLayout": "expanded",
   "language": "zh",
   "display": {
