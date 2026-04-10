@@ -199,6 +199,7 @@ const hudConfigPath = join(claudeDir, 'plugins/claude-hud/config.json');
 let hudConfig = {};
 try { hudConfig = JSON.parse(readFileSync(hudConfigPath, 'utf8')); } catch {}
 const SUBSCRIPTION_MONTHLY = hudConfig.subscription || 200;
+const SUBSCRIPTION_EXPIRATION = hudConfig.subscriptionExpiration || null;
 
 // 1) 跑原生 claude-hud
 const cacheDir = join(claudeDir, 'plugins/cache/claude-hud/claude-hud');
@@ -1148,12 +1149,37 @@ if (tier === 'full') {
     const filled = Math.min(barLen, Math.round((pctUsed / 100) * barLen));
     const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
     const barColor = pctUsed >= 100 ? C.brightGreen : pctUsed >= 70 ? C.brightYellow : C.dim;
+    // 订阅到期倒计时
+    let expiryStr = '';
+    if (SUBSCRIPTION_EXPIRATION) {
+      try {
+        const expDate = new Date(SUBSCRIPTION_EXPIRATION + 'T00:00:00');
+        if (!isNaN(expDate.getTime())) {
+          const today = new Date(); today.setHours(0, 0, 0, 0);
+          const daysLeft = Math.ceil((expDate - today) / 86400_000);
+          const expY = expDate.getFullYear();
+          const expM = String(expDate.getMonth() + 1).padStart(2, '0');
+          const expD = String(expDate.getDate()).padStart(2, '0');
+          const expDateStr = `${expY}-${expM}-${expD}`;
+          if (daysLeft < 0) {
+            expiryStr = `${lbl('已过期')} ${wrap(C.red + C.bold, expDateStr)}`;
+          } else if (daysLeft <= 7) {
+            expiryStr = `${lbl('到期')} ${wrap(C.red, expDateStr)}`;
+          } else if (daysLeft <= 30) {
+            expiryStr = `${lbl('到期')} ${wrap(C.brightYellow, expDateStr)}`;
+          } else {
+            expiryStr = `${lbl('到期')} ${wrap(C.brightCyan, expDateStr)}`;
+          }
+        }
+      } catch {}
+    }
     const costParts = [
       `${lbl('本次')} ${wrap(C.brightYellow, fmtUSD(sessionCost))}`,
       `${lbl('今日')} ${wrap(C.brightYellow, fmtUSD(todayCostLive))}`,
       `${lbl('本月')} ${wrap(C.brightYellow, fmtUSD(monthlyCost))}/${wrap(C.dim, fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(barColor, pctUsed + '%')}`,
       `${wrap(plColor, plLabel)} ${wrap(plColor, fmtUSD(plAbs))}`,
     ];
+    if (expiryStr) costParts.push(expiryStr);
     process.stdout.write(`💰 ${wrap(C.dim, '费用')}  ${costParts.join(wrap(C.dim, ' · '))}\n`);
   }
 
