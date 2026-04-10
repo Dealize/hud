@@ -444,14 +444,29 @@ if (pluginDir && bunPath) {
     for (let i = 0; i < lines.length; i++) {
       if (i === idIdx) continue;
       const s = stripAnsi(lines[i]);
-      if (/上下文|context/i.test(s) && !/用量|usage|本周|weekly/i.test(s)) {
-        // 纯上下文行：重绘 bar + 追加剩余轮数
-        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${rescaleContextBar(lines[i])}${remainTurnsStr}`;
-      } else if (/上下文.*用量|上下文.*本周/i.test(s) || /context.*usage/i.test(s)) {
-        // 合并行（上下文 + 用量 + 本周）：上下文部分重绘，其他保留
-        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${rescaleContextBar(recolorAllPct(lines[i]))}${remainTurnsStr}`;
-      } else if (/用量|usage|本周|weekly/i.test(s)) {
-        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${recolorAllPct(lines[i])}`;
+      if (/上下文|context|用量|usage|本周|weekly/i.test(s)) {
+        // 按 │ 或 | 拆分各段，只重绘上下文的 bar，其他保留原样
+        const parts = lines[i].split(/\s*[│|]\s*/);
+        const rebuilt = parts.map(p => {
+          const ps = stripAnsi(p).trim();
+          if (/上下文|context/i.test(ps)) {
+            // 上下文部分：重绘 bar（50%=满格）+ 追加剩余轮数
+            const m = ps.match(/(\d+(?:\.\d+)?)\s*%/);
+            if (m) {
+              const realPct = parseFloat(m[1]);
+              const effectivePct = Math.min(100, Math.round(realPct * 2));
+              const barLen = 10;
+              const filled = Math.min(barLen, Math.round((effectivePct / 100) * barLen));
+              const barColor = contextThresh(realPct);
+              const bar = wrap(barColor, '█'.repeat(filled)) + wrap(C.dim, '░'.repeat(barLen - filled));
+              return `${wrap(C.dim, '上下文')}${remainTurnsStr} ${bar} ${wrap(barColor + C.bold, realPct + '%')}`;
+            }
+            return p;
+          }
+          // 用量/本周：保留原 bar，只给百分比染色
+          return recolorAllPct(p);
+        });
+        lines[i] = `⏳ ${wrap(C.dim, '额度')}  ${rebuilt.join(wrap(C.dim, ' │ '))}`;
       }
     }
 
