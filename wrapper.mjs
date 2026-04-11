@@ -146,7 +146,49 @@ const US_HOLIDAYS = new Set([...buildUSHolidays(_curYear), ...buildUSHolidays(_c
 
 // ANSI 工具
 const stripAnsiGlobal = s => s.replace(/\x1b\[[0-9;]*m/g, '');
-const visLen = s => stripAnsiGlobal(s).length;
+
+// 计算单个字符的终端显示宽度（CJK=2, emoji=2, 其他=1）
+function charDisplayWidth(codePoint) {
+  if (codePoint <= 0x1F || codePoint === 0x7F) return 0; // 控制字符
+  if (codePoint >= 0x0300 && codePoint <= 0x036F) return 0; // 组合变音符号
+  // CJK 统一表意文字
+  if ((codePoint >= 0x2E80 && codePoint <= 0x9FFF) ||
+      (codePoint >= 0xAC00 && codePoint <= 0xD7AF) || // 韩文音节
+      (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||
+      (codePoint >= 0xFE30 && codePoint <= 0xFE6F) || // CJK 兼容形式
+      (codePoint >= 0xFF01 && codePoint <= 0xFF60) || // 全角 ASCII
+      (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) || // 全角货币符号
+      (codePoint >= 0x20000 && codePoint <= 0x2FA1F) || // CJK 扩展
+      (codePoint >= 0x30000 && codePoint <= 0x3134F)) return 2;
+  // Emoji 范围（主要区块）
+  if ((codePoint >= 0x1F300 && codePoint <= 0x1F9FF) || // 杂项符号和象形文字 + 补充
+      (codePoint >= 0x1FA00 && codePoint <= 0x1FA6F) || // 棋子扩展
+      (codePoint >= 0x1FA70 && codePoint <= 0x1FAFF) || // 符号扩展-A
+      (codePoint >= 0x2600 && codePoint <= 0x27BF) ||   // 杂项符号 + 装饰符号
+      (codePoint >= 0x23E9 && codePoint <= 0x23FF) ||   // ⏩⏳⏱ 等 emoji 风格符号
+      (codePoint >= 0x2700 && codePoint <= 0x27BF) ||   // 装饰符号（✏ 等）
+      (codePoint >= 0x2B50 && codePoint <= 0x2B55)) return 2; // ⭐⭕ 等
+  if (codePoint === 0xFE0F || codePoint === 0x200D) return 0; // VS-16 / ZWJ 不占宽
+  // 东亚宽度的特殊符号
+  if ((codePoint >= 0x2500 && codePoint <= 0x257F) || // 制表符（Box Drawing）→ 宽度1
+      (codePoint >= 0x2580 && codePoint <= 0x259F) || // 方块元素（░▒▓█）→ 宽度1
+      (codePoint >= 0x25A0 && codePoint <= 0x25FF)) return 1; // 几何形状
+  // ┃ │ 等分隔符 → 宽度1
+  if (codePoint === 0x2503 || codePoint === 0x2502) return 1;
+  return 1;
+}
+
+// 计算字符串的终端显示宽度（排除 ANSI 转义序列）
+function strDisplayWidth(s) {
+  const plain = stripAnsiGlobal(s);
+  let width = 0;
+  for (const ch of plain) {
+    width += charDisplayWidth(ch.codePointAt(0));
+  }
+  return width;
+}
+
+const visLen = s => strDisplayWidth(s);
 // 右侧追加：紧跟左内容后面用加粗分隔符拼接，超宽则丢弃右侧
 const rightAppend = (left, right) => {
   if (!right) return left;
@@ -155,13 +197,14 @@ const rightAppend = (left, right) => {
   return left + sep + right;
 };
 
-// ANSI-aware 截断：保留不可见转义序列，截断可见字符到 maxWidth
+// ANSI-aware 截断：保留不可见转义序列，截断可见字符到 maxWidth（正确处理 CJK/emoji 宽度）
 function truncateLine(line, maxWidth) {
   let visible = 0;
   let out = '';
   let i = 0;
   while (i < line.length) {
     const ch = line[i];
+    // 跳过 ANSI 转义序列
     if (ch === '\x1b' && line[i + 1] === '[') {
       const end = line.indexOf('m', i);
       if (end !== -1) {
@@ -170,10 +213,14 @@ function truncateLine(line, maxWidth) {
         continue;
       }
     }
-    if (visible >= maxWidth) { i++; continue; }
-    out += ch;
-    visible++;
-    i++;
+    // 处理 surrogate pair（emoji 等 BMP 外字符）
+    let codePoint = line.codePointAt(i);
+    let charLen = codePoint > 0xFFFF ? 2 : 1;
+    let w = charDisplayWidth(codePoint);
+    if (visible + w > maxWidth) break; // 放不下就停止，不切碎字符
+    out += line.slice(i, i + charLen);
+    visible += w;
+    i += charLen;
   }
   return out + '\x1b[0m';
 }
@@ -964,7 +1011,7 @@ if (cwd) {
 
 const thinking = '';
 
-// 5) token 速度 + sparkline（拆成两个返回值）+ 🌡️ API 体感温度
+// 5) token 速度 + sparkline（拆成两个返回值）+ 🌡 API 体感温度
 let sparkLine = '';
 let apiTempStr = '';
 function renderSpeedLine() {
@@ -1030,7 +1077,7 @@ function renderSpeedLine() {
   if (current > state.globalPeak) state.globalPeak = current;
   try { writeFileSync(statePath, JSON.stringify(state)); } catch {}
 
-  // 🌡️ TTFT 体感：最近 20 次中位数做基线，对比最新值
+  // 🌡 TTFT 体感：最近 20 次中位数做基线，对比最新值
   if (meta.transcript_path && existsSync(meta.transcript_path)) {
     try {
       const tLines = readFileSync(meta.transcript_path, 'utf8').split('\n').filter(Boolean);
@@ -1059,10 +1106,10 @@ function renderSpeedLine() {
         const latest = ttfts[ttfts.length - 1];
         const ratio = median > 0 ? latest / median : 1;
         const latestSec = (latest / 1000).toFixed(1);
-        if (ratio <= 1.5)      apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightGreen, '畅通')}`;
-        else if (ratio <= 2.0) apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightCyan, '正常')}`;
-        else if (ratio <= 3.0) apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.brightYellow, '偏慢')}`;
-        else                   apiTempStr = `🌡️ ${wrap(C.dim, '响应')} ${wrap(C.red + C.bold, '拥堵')}`;
+        if (ratio <= 1.5)      apiTempStr = `🌡 ${wrap(C.dim, '响应')} ${wrap(C.brightGreen, '畅通')}`;
+        else if (ratio <= 2.0) apiTempStr = `🌡 ${wrap(C.dim, '响应')} ${wrap(C.brightCyan, '正常')}`;
+        else if (ratio <= 3.0) apiTempStr = `🌡 ${wrap(C.dim, '响应')} ${wrap(C.brightYellow, '偏慢')}`;
+        else                   apiTempStr = `🌡 ${wrap(C.dim, '响应')} ${wrap(C.red + C.bold, '拥堵')}`;
       }
     } catch {}
   }
@@ -1128,7 +1175,7 @@ function trend(val, base) {
 }
 
 if (tier === 'full') {
-  // 4. ⚡ 速度 + 🌡️ 响应 + ⏰ 时钟/US
+  // 4. ⚡ 速度 + 🌡 响应 + ⏰ 时钟/US
   const speedLine = renderSpeedLine();
   const clockStr = renderClock();
   const speedRight = [apiTempStr, clockStr].filter(Boolean).join(wrap(C.dim, ' │ '));
