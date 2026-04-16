@@ -97,6 +97,7 @@ const speedColor = (v, peak) => {
 
 // API 定价（$/MTok）— https://platform.claude.com/docs/about-claude/pricing
 const PRICING = {
+  'opus-4.7':   { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, inputLong: 10, outputLong: 37.5 },
   'opus-4.6':   { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, inputLong: 10, outputLong: 37.5 },
   'opus-4.5':   { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25, inputLong: 10, outputLong: 37.5 },
   'opus-4.1':   { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
