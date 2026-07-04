@@ -19,7 +19,7 @@ usage() {
   echo ""
   echo "命令:"
   echo "  subscription <金额>    设置月订阅费用（USD），如: ./configure.sh subscription 100"
-  echo "  expiration <日期>      设置订阅到期日期，如: ./configure.sh expiration 2026-12-31"
+  echo "  expiration <日期>      设置账单锚点日（取“日”作每月续费日，到期/本期费用自动按周期滚动），如: ./configure.sh expiration 2026-05-09"
   echo "  show                   显示当前配置"
   echo "  set <key> <value>      设置任意配置项，如: ./configure.sh set language en"
   echo "  display <key> <bool>   切换显示开关，如: ./configure.sh display showGit false"
@@ -93,7 +93,7 @@ case "${1:-}" in
   expiration|exp)
     if [ -z "${2:-}" ]; then
       current=$(jq -r '.subscriptionExpiration // "未设置"' "$CONFIG")
-      echo "当前到期日期: $current"
+      echo "当前账单锚点日: ${current}（取“日”作每月续费日，自动按周期滚动，无需手动更新）"
       echo "用法: ./configure.sh expiration <YYYY-MM-DD>"
       exit 0
     fi
@@ -105,7 +105,7 @@ case "${1:-}" in
     TMP=$(mktemp)
     jq --arg v "$date_val" '.subscriptionExpiration = $v' "$CONFIG" > "$TMP"
     mv "$TMP" "$CONFIG"
-    echo "✅ 订阅到期日期已设为 $date_val"
+    echo "✅ 账单锚点日已设为 ${date_val}（每月 ${date_val:8:2} 号续费，自动滚动）"
     ;;
 
   help|--help|-h)

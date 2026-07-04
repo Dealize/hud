@@ -802,14 +802,39 @@ if (existsSync(projectsDirLive)) {
 pAgg.today = todayPromptsLive;
 sAgg.today = todaySessionsLive;
 
-// 月度费用聚合：缓存中非今日 + 今日实时
+// 账单周期推算：subscriptionExpiration 的“日”作为每月账单锚点日（每个用户各自不同）
+// 实时推算当前周期 [start, end)，end = 下次续费日，永远指向未来；未配置则回退到日历月
+function billingCycle(anchorStr, now) {
+  const m = /^\d{4}-\d{2}-(\d{2})$/.exec(anchorStr || '');
+  if (!m) return null;
+  const anchorDay = parseInt(m[1], 10);
+  const onAnchor = (y, mon) => {
+    const last = new Date(y, mon + 1, 0).getDate();        // 该月天数
+    const d = new Date(y, mon, Math.min(anchorDay, last)); // 月末不足则取月末（如 31 号锚点遇 2 月）
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+  const t = new Date(now); t.setHours(0, 0, 0, 0);
+  let start = onAnchor(t.getFullYear(), t.getMonth());
+  if (start > t) start = onAnchor(t.getFullYear(), t.getMonth() - 1); // 今天还没到本月锚点 → 周期从上月锚点起
+  const end = onAnchor(start.getFullYear(), start.getMonth() + 1);    // 下次续费日
+  return { start, end };
+}
+
+// 费用聚合：缓存中非今日 + 今日实时。按账单周期求和（未配置到期日则按日历月）
 const todayStr = localDate(new Date());
+const cycle = billingCycle(SUBSCRIPTION_EXPIRATION, new Date());
+const cycleBased = !!cycle;
+const cycleStartStr = cycleBased ? localDate(cycle.start) : null;
+const cycleEndStr = cycleBased ? localDate(cycle.end) : null;
 const monthPrefix = todayStr.slice(0, 7); // "YYYY-MM"
 let monthlyCost = 0;
 for (const [d, c] of Object.entries(stats.costBuckets || {})) {
-  if (d.startsWith(monthPrefix) && d !== todayStr) monthlyCost += c;
+  if (d === todayStr) continue;
+  const inWindow = cycleBased ? (d >= cycleStartStr && d < cycleEndStr) : d.startsWith(monthPrefix);
+  if (inWindow) monthlyCost += c;
 }
-monthlyCost += todayCostLive;
+monthlyCost += todayCostLive; // 今天必在当前周期内
 const profitLoss = monthlyCost - SUBSCRIPTION_MONTHLY;
 
 // 🔥 连续天数 (Streak)
@@ -1197,34 +1222,20 @@ if (tier === 'full') {
     const filled = Math.min(barLen, Math.round((pctUsed / 100) * barLen));
     const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
     const barColor = pctUsed >= 100 ? C.brightGreen : pctUsed >= 70 ? C.brightYellow : C.dim;
-    // 订阅到期倒计时
+    // 订阅续费倒计时：到期日 = 当前账单周期的下次续费日（实时推算，永远指向未来）+ 剩余天数
     let expiryStr = '';
-    if (SUBSCRIPTION_EXPIRATION) {
-      try {
-        const expDate = new Date(SUBSCRIPTION_EXPIRATION + 'T00:00:00');
-        if (!isNaN(expDate.getTime())) {
-          const today = new Date(); today.setHours(0, 0, 0, 0);
-          const daysLeft = Math.ceil((expDate - today) / 86400_000);
-          const expY = expDate.getFullYear();
-          const expM = String(expDate.getMonth() + 1).padStart(2, '0');
-          const expD = String(expDate.getDate()).padStart(2, '0');
-          const expDateStr = `${expY}-${expM}-${expD}`;
-          if (daysLeft < 0) {
-            expiryStr = `${lbl('已过期')} ${wrap(C.red + C.bold, expDateStr)}`;
-          } else if (daysLeft <= 7) {
-            expiryStr = `${lbl('到期')} ${wrap(C.red, expDateStr)}`;
-          } else if (daysLeft <= 30) {
-            expiryStr = `${lbl('到期')} ${wrap(C.brightYellow, expDateStr)}`;
-          } else {
-            expiryStr = `${lbl('到期')} ${wrap(C.brightCyan, expDateStr)}`;
-          }
-        }
-      } catch {}
+    if (cycle) {
+      const expDate = cycle.end;
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const daysLeft = Math.ceil((expDate - today) / 86400_000);
+      const expDateStr = localDate(expDate);
+      const expColor = daysLeft <= 7 ? C.red : daysLeft <= 30 ? C.brightYellow : C.brightCyan;
+      expiryStr = `${lbl('到期')} ${wrap(expColor, expDateStr)} ${wrap(C.dim, '剩')}${wrap(expColor, daysLeft)}${wrap(C.dim, '天')}`;
     }
     const costParts = [
       `${lbl('本次')} ${wrap(C.brightYellow, fmtUSD(sessionCost))}`,
       `${lbl('今日')} ${wrap(C.brightYellow, fmtUSD(todayCostLive))}`,
-      `${lbl('本月')} ${wrap(C.brightYellow, fmtUSD(monthlyCost))}/${wrap(C.dim, fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(barColor, pctUsed + '%')}`,
+      `${lbl(cycleBased ? '本期' : '本月')} ${wrap(C.brightYellow, fmtUSD(monthlyCost))}/${wrap(C.dim, fmtUSD(SUBSCRIPTION_MONTHLY))} ${wrap(barColor, bar)} ${wrap(barColor, pctUsed + '%')}`,
       `${wrap(plColor, plLabel)} ${wrap(plColor, fmtUSD(plAbs))}`,
     ];
     if (expiryStr) costParts.push(expiryStr);

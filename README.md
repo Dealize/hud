@@ -124,12 +124,15 @@ HUD 应该出现在输入框下方。
 
 - **本次**：当前会话累计费用
 - **今日**：今日所有会话累计费用
-- **本月**：本月累计费用 / 订阅金额 + 进度条
-- **赚/亏**：本月 API 等价费用 − 订阅金额（绿色=省钱，红色=多付）
+- **本期**：当前账单周期累计费用 / 订阅金额 + 进度条（设了 `subscriptionExpiration` 时按账单周期统计，否则回退到日历月并显示为「本月」）
+- **赚/亏**：本期 API 等价费用 − 订阅金额（绿色=省钱，红色=多付）
+- **到期**：下次续费日，实时按账单周期自动滚动（无需手动更新）；未设 `subscriptionExpiration` 则不显示
 
 支持全系列 Claude 模型自动检测定价，包含 input / output / cache read / cache write / >200K 长上下文溢价。
 
 `subscription` 默认 200（Max 订阅），可通过 `./configure.sh subscription <金额>` 或直接编辑 config.json 修改。
+
+`subscriptionExpiration` 是**账单锚点日**：只取日期的「日」作每月续费日（每人各自不同）。到期日与「本期」费用会每次渲染实时推算当前账单周期 `[本期起, 下次续费)`，永远指向未来最近续费日，账单周期一到费用自动归零重算。通过 `./configure.sh expiration <YYYY-MM-DD>` 设置。
 
 修改后无需重启，下次 statusLine 触发渲染就生效。
 
